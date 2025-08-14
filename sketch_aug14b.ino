@@ -16,7 +16,7 @@
     8) Decay counts occasionally to avoid overflow.
 
   Pins:
-    LDR_L_PIN A4, LDR_R_PIN A5, LDR_C_PIN A3, PLATE_PIN 8,
+    LDR_L_PIN A4, LDR_R_PIN A5, LDR_C_PIN A3, BUTTON_PIN 8, PLATE_PIN 9,
     SERVO_PIN A0, BEEP_PIN A1,
     ENA 6, IN1 2, IN2 3, ENB 5, IN3 4, IN4 7
 */
@@ -30,7 +30,8 @@
 #define LDR_L_PIN   A4
 #define LDR_R_PIN   A5
 #define LDR_C_PIN   A3
-#define PLATE_PIN   8
+#define BUTTON_PIN  8
+#define PLATE_PIN   9
 #define SERVO_PIN   A0
 #define BEEP_PIN    A1
 #define ENA         6
@@ -95,6 +96,8 @@ const uint8_t BANDIT_REWARD_STEP = 2; // how many counts to add/sub (>=1)
 const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
 
 const uint16_t RAND_MAX16 = 65535;
+const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
+
 const int16_t PLATE_PENALTY_Q8 = -256; // penalty when collision plates touch
 
 // -----------------------------
@@ -127,6 +130,7 @@ uint8_t last_beep_bin  = 0;
 int last_r = 0;
 int last_l = 0;
 int last_c = 0;
+bool last_button_pressed = false;
 bool last_plate_contact = false;
 
 Servo servo;
@@ -395,11 +399,18 @@ int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
   last_r = r;
   last_l = l;
   last_c = c;
+  last_button_pressed = (digitalRead(BUTTON_PIN) == LOW);
   last_plate_contact = (digitalRead(PLATE_PIN) == LOW);
 
   // If collision plates touch, return fixed penalty.
   if (last_plate_contact) {
     return PLATE_PENALTY_Q8;
+  }
+
+  // If reward button is pressed, return fixed reward.
+  if (last_button_pressed) {
+    return BUTTON_REWARD_Q8;
+
   }
 
   // Reward idea: balance between A4 & A5 plus brightness on A3.
@@ -536,6 +547,7 @@ void setup(){
   pinMode(LDR_L_PIN, INPUT);
   pinMode(LDR_R_PIN, INPUT);
   pinMode(LDR_C_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(PLATE_PIN, INPUT_PULLUP);
 
   pinMode(ENA, OUTPUT);
@@ -625,6 +637,9 @@ void loop(){
 
   if (last_plate_contact) {
     Serial.print(F("Plate contact "));
+  }
+  if (last_button_pressed) {
+    Serial.print(F("Button pressed "));
   }
   Serial.print(F("A5=")); Serial.print(last_r);
   Serial.print(F(" A4=")); Serial.print(last_l);

@@ -16,7 +16,7 @@
     8) Decay counts occasionally to avoid overflow.
 
   Pins:
-    LDR_L_PIN A4, LDR_R_PIN A5, LDR_C_PIN A3, BUTTON_PIN 8,
+    LDR_L_PIN A4, LDR_R_PIN A5, LDR_C_PIN A3, BUTTON_PIN 8, PLATE_PIN 9,
     SERVO_PIN A0, BEEP_PIN A1,
     ENA 6, IN1 2, IN2 3, ENB 5, IN3 4, IN4 7
 */
@@ -31,6 +31,7 @@
 #define LDR_R_PIN   A5
 #define LDR_C_PIN   A3
 #define BUTTON_PIN  8
+#define PLATE_PIN   9
 #define SERVO_PIN   A0
 #define BEEP_PIN    A1
 #define ENA         6
@@ -95,7 +96,8 @@ const uint8_t BANDIT_REWARD_STEP = 2; // how many counts to add/sub (>=1)
 const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
 
 const uint16_t RAND_MAX16 = 65535;
-const int16_t BUTTON_REWARD_Q8 = 256; // reward when button pressed
+const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
+const int16_t PLATE_PENALTY_Q8 = -256; // penalty when collision plates touch
 
 // -----------------------------
 // State & learning structures
@@ -128,6 +130,7 @@ int last_r = 0;
 int last_l = 0;
 int last_c = 0;
 bool last_button_pressed = false;
+bool last_plate_contact = false;
 
 Servo servo;
 
@@ -396,8 +399,14 @@ int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
   last_l = l;
   last_c = c;
   last_button_pressed = (digitalRead(BUTTON_PIN) == LOW);
+  last_plate_contact = (digitalRead(PLATE_PIN) == LOW);
 
-  // If button is pressed, return fixed reward.
+  // If collision plates touch, return fixed penalty.
+  if (last_plate_contact) {
+    return PLATE_PENALTY_Q8;
+  }
+
+  // If reward button is pressed, return fixed reward.
   if (last_button_pressed) {
     return BUTTON_REWARD_Q8;
   }
@@ -537,6 +546,7 @@ void setup(){
   pinMode(LDR_R_PIN, INPUT);
   pinMode(LDR_C_PIN, INPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(PLATE_PIN, INPUT_PULLUP);
 
   pinMode(ENA, OUTPUT);
   pinMode(IN1, OUTPUT);
@@ -623,6 +633,9 @@ void loop(){
     Serial.print(F(" adv=")); Serial.println(adv_q8);
   }
 
+  if (last_plate_contact) {
+    Serial.print(F("Plate contact "));
+  }
   if (last_button_pressed) {
     Serial.print(F("Button pressed "));
   }

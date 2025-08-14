@@ -3,7 +3,7 @@
   Hardware: Arduino Uno R3
 
   Flow each loop:
-    1) Read sensors & build 5-D feature vector x (uint8 scaled).
+    1) Read sensors & build 6-D feature vector x (uint8 scaled).
     2) Sample next_state ~ Markov(s_prev → ·) using integer counts.
     3) For that state, build action scores = bandit_score + Φ(x) per actuator.
     4) ε-greedy select: motor bin (9), servo bin (10), beep bin (5).
@@ -16,7 +16,8 @@
     8) Decay counts occasionally to avoid overflow.
 
   Pins:
-    LDR_L_PIN A4, LDR_R_PIN A5, SERVO_PIN A0, BEEP_PIN A1,
+    LDR_L_PIN A4, LDR_R_PIN A5, LDR_C_PIN A3, BUTTON_PIN 8,
+    SERVO_PIN A0, BEEP_PIN A1,
     ENA 6, IN1 2, IN2 3, ENB 5, IN3 4, IN4 7
 */
 
@@ -28,6 +29,8 @@
 // -----------------------------
 #define LDR_L_PIN   A4
 #define LDR_R_PIN   A5
+#define LDR_C_PIN   A3
+#define BUTTON_PIN  8
 #define SERVO_PIN   A0
 #define BEEP_PIN    A1
 #define ENA         6
@@ -62,7 +65,7 @@ const uint8_t N_STATE = 8;
 const uint8_t N_MOTOR = 9;   // 9 speed bins (includes reverse/stop/forward)
 const uint8_t N_SERVO = 10;  // 10 positions [0..180]
 const uint8_t N_BEEP  = 5;   // 5 pitch bins
-const uint8_t FEAT_DIM = 5;  // [ldrL, ldrR, lastMotor, lastServo, bias]
+const uint8_t FEAT_DIM = 6;  // [ldrL, ldrR, ldrC, lastMotor, lastServo, bias]
 
 struct Feat {
   uint8_t x[FEAT_DIM]; // scaled to [0..255]
@@ -92,6 +95,7 @@ const uint8_t BANDIT_REWARD_STEP = 2; // how many counts to add/sub (>=1)
 const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
 
 const uint16_t RAND_MAX16 = 65535;
+const int16_t BUTTON_REWARD_Q8 = 256; // reward when button pressed
 
 // -----------------------------
 // State & learning structures
@@ -119,6 +123,11 @@ uint8_t prev_state = 0;
 uint8_t last_motor_bin = N_MOTOR/2; // start near stop
 uint8_t last_servo_bin = N_SERVO/2; // mid
 uint8_t last_beep_bin  = 0;
+
+int last_r = 0;
+int last_l = 0;
+int last_c = 0;
+bool last_button_pressed = false;
 
 Servo servo;
 
@@ -174,10 +183,12 @@ void init_counts() {
 Feat read_features() {
   int l0 = analogRead(LDR_L_PIN); // 0..1023
   int r0 = analogRead(LDR_R_PIN); // 0..1023
+  int c0 = analogRead(LDR_C_PIN); // 0..1023
 
   // compress to 0..255
   uint8_t l = (uint8_t)(l0 >> 2);
   uint8_t r = (uint8_t)(r0 >> 2);
+  uint8_t c = (uint8_t)(c0 >> 2);
 
   // last motor/servo as scaled bins (0..255)
   uint8_t lm = (uint8_t)( (uint16_t)last_motor_bin * 28 ); // 9*28=252
@@ -186,9 +197,10 @@ Feat read_features() {
   Feat F;
   F.x[0] = l;
   F.x[1] = r;
-  F.x[2] = lm;
-  F.x[3] = ls;
-  F.x[4] = 255; // bias
+  F.x[2] = c;
+  F.x[3] = lm;
+  F.x[4] = ls;
+  F.x[5] = 255; // bias
   return F;
 }
 
@@ -226,7 +238,7 @@ void build_scores(uint8_t state, const Feat& F, Scores& S){
   if(!sm) sm=1; if(!ss) ss=1; if(!sb) sb=1;
 
   // Φ(x): compute per action column (dot product W[:,a]·x)
-  // Keep it cheap: int16 acc (max 5 * 127 * 255 ~ 161k)
+  // Keep it cheap: int16 acc (max 6 * 127 * 255 ~ 194k)
   // Then downscale to a small range by >> 8
   for (uint8_t i=0;i<N_MOTOR;++i){
     int16_t phi = 0;
@@ -375,21 +387,28 @@ inline void set_motor_state9(uint8_t bin){
 // Reward
 // -----------------------------
 int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
-  // Reward idea: brighter is better, and balance gets a small bonus.
-  int l = analogRead(LDR_L_PIN); // 0..1023
-  int r = analogRead(LDR_R_PIN);
-  int sum = l + r;               // 0..2046
-  int diff = abs(l - r);         // 0..1023
+  // Read sensors up front and remember values for reporting.
+  int r = analogRead(LDR_R_PIN); // A5 0..1023
+  int l = analogRead(LDR_L_PIN); // A4 0..1023
+  int c = analogRead(LDR_C_PIN); // A3 0..1023
 
-  // sum term scaled to ~[0..+256]
-  int16_t sum_q8 = (int16_t)((uint32_t)sum * 256u / 2046u);
-  // balance bonus: higher when diff small; map (1023-diff) to [0..+64]
-  int16_t bal_q8 = (int16_t)((uint32_t)(1023 - diff) * 64u / 1023u);
+  last_r = r;
+  last_l = l;
+  last_c = c;
+  last_button_pressed = (digitalRead(BUTTON_PIN) == LOW);
 
-  int16_t r_q8 = sum_q8 + bal_q8; // [0..320]
-  // center to roughly [-128..+192] by subtracting 128
-  r_q8 -= 128;
-  // clamp to [-256..256]
+  // If button is pressed, return fixed reward.
+  if (last_button_pressed) {
+    return BUTTON_REWARD_Q8;
+  }
+
+  // Reward idea: balance between A4 & A5 plus brightness on A3.
+  int clos = 1023 - abs(l - r);  // 0..1023 (higher when closer)
+
+  int16_t clos_q8 = (int16_t)((uint32_t)clos * 256u / 1023u); // 0..256
+  int16_t c_q8    = (int16_t)((uint32_t)c    * 256u / 1023u); // 0..256
+
+  int16_t r_q8 = clos_q8 + c_q8 - 256; // [-256..+256]
   if (r_q8 > 256) r_q8 = 256;
   if (r_q8 < -256) r_q8 = -256;
   return r_q8;
@@ -516,6 +535,8 @@ void setup(){
 
   pinMode(LDR_L_PIN, INPUT);
   pinMode(LDR_R_PIN, INPUT);
+  pinMode(LDR_C_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   pinMode(ENA, OUTPUT);
   pinMode(IN1, OUTPUT);
@@ -601,4 +622,11 @@ void loop(){
     Serial.print(F(" r=")); Serial.print(r_q8);
     Serial.print(F(" adv=")); Serial.println(adv_q8);
   }
+
+  if (last_button_pressed) {
+    Serial.print(F("Button pressed "));
+  }
+  Serial.print(F("A5=")); Serial.print(last_r);
+  Serial.print(F(" A4=")); Serial.print(last_l);
+  Serial.print(F(" A3=")); Serial.println(last_c);
 }

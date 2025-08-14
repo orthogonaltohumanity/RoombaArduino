@@ -97,6 +97,7 @@ const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
 
 const uint16_t RAND_MAX16 = 65535;
 const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
+
 const int16_t PLATE_PENALTY_Q8 = -256; // penalty when collision plates touch
 
 // -----------------------------
@@ -409,6 +410,7 @@ int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
   // If reward button is pressed, return fixed reward.
   if (last_button_pressed) {
     return BUTTON_REWARD_Q8;
+
   }
 
   // Reward idea: balance between A4 & A5 plus brightness on A3.

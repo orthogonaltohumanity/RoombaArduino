@@ -149,6 +149,22 @@ bool last_plate_contact = false;
 
 Servo servo;
 
+// Exponential moving average smoothing for photoresistors
+const uint8_t LDR_SMOOTH_SHIFT = 3; // 1/8th smoothing factor
+uint16_t ldr_l_avg = 0;
+uint16_t ldr_r_avg = 0;
+uint16_t ldr_c_avg = 0;
+
+inline uint16_t smooth_analog_read(uint8_t pin, uint16_t &avg) {
+  uint16_t raw = analogRead(pin);
+  if (avg == 0) {
+    avg = raw;
+  } else {
+    avg += ((int16_t)raw - (int16_t)avg) >> LDR_SMOOTH_SHIFT;
+  }
+  return avg;
+}
+
 inline uint16_t urand16() {
   // Combine two rand() for more bits (rand() on AVR is 15-bit)
   return ( (uint16_t)rand() << 1 ) ^ (uint16_t)rand();
@@ -199,9 +215,9 @@ void init_counts() {
 
 
 Feat read_features() {
-  int l0 = analogRead(LDR_L_PIN); // 0..1023
-  int r0 = analogRead(LDR_R_PIN); // 0..1023
-  int c0 = analogRead(LDR_C_PIN); // 0..1023
+  uint16_t l0 = smooth_analog_read(LDR_L_PIN, ldr_l_avg); // 0..1023
+  uint16_t r0 = smooth_analog_read(LDR_R_PIN, ldr_r_avg); // 0..1023
+  uint16_t c0 = smooth_analog_read(LDR_C_PIN, ldr_c_avg); // 0..1023
 
   // compress to 0..255
   uint8_t l = (uint8_t)(l0 >> 2);
@@ -406,10 +422,10 @@ inline void set_motor_state9(uint8_t bin){
 // Reward
 // -----------------------------
 int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
-  // Read sensors up front and remember values for reporting.
-  int r = analogRead(LDR_R_PIN); // A5 0..1023
-  int l = analogRead(LDR_L_PIN); // A4 0..1023
-  int c = analogRead(LDR_C_PIN); // A3 0..1023
+  // Read sensors up front with smoothing and remember values for reporting.
+  int r = smooth_analog_read(LDR_R_PIN, ldr_r_avg); // A5 0..1023
+  int l = smooth_analog_read(LDR_L_PIN, ldr_l_avg); // A4 0..1023
+  int c = smooth_analog_read(LDR_C_PIN, ldr_c_avg); // A3 0..1023
 
   last_r = r;
   last_l = l;

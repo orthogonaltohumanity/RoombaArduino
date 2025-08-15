@@ -290,17 +290,14 @@ uint8_t random_index(){
 }
 template<uint8_t N>
 uint8_t sample_from_logits(const int16_t *arr){
-  // Softmax sampling with integer weights: p[i] ∝ 2^{arr[i]}
-  int16_t mx = arr[0];
-  for (uint8_t i=1; i<N; ++i) if (arr[i] > mx) mx = arr[i];
-
-  uint16_t w[N];
+  // Softmax sampling with integer weights: p[i] ∝ (arr[i])^2
+  uint32_t w[N];
   uint32_t sum = 0;
   for (uint8_t i=0; i<N; ++i){
-    int16_t diff = mx - arr[i];            // non-negative
-    if (diff > 15) diff = 15;              // clamp to avoid overflow
-    w[i] = (uint16_t)1 << (15 - diff);     // weight ∝ 2^{arr[i]}
-    sum += w[i];
+    int32_t v = arr[i];
+    uint32_t wi = (uint32_t)(v * v); // square to ensure non-negative weight
+    w[i] = wi;
+    sum += wi;
   }
 
   if (sum == 0) return (uint8_t)(urand16() % N); // defensive

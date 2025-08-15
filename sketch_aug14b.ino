@@ -94,7 +94,6 @@ const uint8_t DECAY_DIV = 2;        // halve counts (>=1)
 const uint8_t BANDIT_REWARD_STEP = 2; // how many counts to add/sub (>=1)
 const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
 
-const uint16_t RAND_MAX16 = 65535;
 const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
 
 const int16_t PLATE_PENALTY_Q8 = -256; // penalty when collision plates touch
@@ -227,7 +226,7 @@ uint8_t sample_next_state(uint8_t s){
 
 // -----------------------------
 // Build action scores = bandit preference + Φ(x)
-// We'll use ε-greedy over these integer "scores".
+// We'll apply ε-greedy with a softmax sample over these logits.
 // -----------------------------
 
 
@@ -290,51 +289,41 @@ uint8_t random_index(){
   return (uint8_t)(urand16() % N);
 }
 template<uint8_t N>
-uint8_t sample_from_scores_as_weights(const int16_t *arr){
-  // Find minimum to shift scores to positive weights
-  int16_t mn = arr[0];
-  for (uint8_t i=1;i<N;++i) if (arr[i] < mn) mn = arr[i];
-
-  // Shift = -(mn) + 1 ensures all weights >= 1 (avoids zero)
-  uint16_t shift = (uint16_t)(-(int32_t)mn + 1);
-
-  // Compute sum of weights (use 32-bit accumulator to be safe)
+uint8_t sample_from_logits(const int16_t *arr){
+  // Softmax sampling with integer weights: p[i] ∝ (arr[i])^2
+  uint32_t w[N];
   uint32_t sum = 0;
-  uint16_t w[N];
-  for (uint8_t i=0;i<N;++i){
-    // weight = arr[i] + shift (arr[i] is int16, shift is uint16)
-    int32_t tmp = (int32_t)arr[i] + (int32_t)shift; // guaranteed >= 1
-    uint16_t wi = (tmp > 65535) ? 65535 : (uint16_t)tmp; // clamp just in case
+  for (uint8_t i=0; i<N; ++i){
+    int32_t v = arr[i];
+    uint32_t wi = (uint32_t)(v * v); // square to ensure non-negative weight
     w[i] = wi;
     sum += wi;
   }
 
-  // Fallback: if something went wrong, choose uniform random
-  if (sum == 0) return (uint8_t)(urand16() % N);
+  if (sum == 0) return (uint8_t)(urand16() % N); // defensive
 
-  // Sample categorical
-  uint32_t r = (uint32_t)(urand16()) % sum;
+  uint32_t r = ((uint32_t)urand16() << 16 | urand16()) % sum;
   uint32_t acc = 0;
-  for (uint8_t i=0;i<N;++i){
+  for (uint8_t i=0; i<N; ++i){
     acc += w[i];
     if (r < acc) return i;
   }
-  return (uint8_t)((uint16_t)sum % N); // defensive fallback
+  return (uint8_t)(urand16() % N); // fallback
 }
 
 uint8_t pick_with_eps_greedy_motor(const Scores& S){
   if (randPct() < EPS_EGREEDY_PCT) return random_index<N_MOTOR>();
-  return sample_from_scores_as_weights<N_MOTOR>(S.motor);
+  return sample_from_logits<N_MOTOR>(S.motor);
 }
 
 uint8_t pick_with_eps_greedy_servo(const Scores& S){
   if (randPct() < EPS_EGREEDY_PCT) return random_index<N_SERVO>();
-  return sample_from_scores_as_weights<N_SERVO>(S.servo);
+  return sample_from_logits<N_SERVO>(S.servo);
 }
 
 uint8_t pick_with_eps_greedy_beep(const Scores& S){
   if (randPct() < EPS_EGREEDY_PCT) return random_index<N_BEEP>();
-  return sample_from_scores_as_weights<N_BEEP>(S.beep);
+  return sample_from_logits<N_BEEP>(S.beep);
 }
 
 // -----------------------------
@@ -347,11 +336,23 @@ uint8_t servo_bin_to_deg(uint8_t b){
   return (uint8_t)( (uint16_t)b * 20 ); // 0,20,40,...,180
 }
 
-int beep_bin_to_freq(uint8_t b){
-  // simple scale
-  if (b >= N_BEEP) b = N_BEEP-1;
-  return b;
-}
+// Creative beep patterns: frequency and duration for each of 5 tones per bin
+const uint8_t BEEP_TONES = 5;
+const uint16_t BEEP_FREQ[N_BEEP][BEEP_TONES] = {
+  {262, 330, 392, 523, 659}, // C-major ascent (unused when b_bin==0)
+  {659, 523, 392, 330, 262}, // mirror descent
+  {262, 392, 523, 392, 262}, // rise then fall
+  {330, 262, 330, 392, 523}, // low hop to high
+  {523, 440, 392, 440, 523}  // bell curve
+};
+
+const uint16_t BEEP_DUR[N_BEEP][BEEP_TONES] = {
+  {100, 100, 100, 100, 200}, // quick run with hold
+  {200, 100, 100, 100, 200}, // long bookends
+  {150, 150, 300, 150, 150}, // lingering center
+  {100, 200, 100, 200, 300}, // growing finale
+  {300, 150, 150, 150, 300}  // long ends
+};
 
 // Low-level: command one side given dir in {-1,0,+1} and pwm (0..255)
 inline void set_one_motor(int8_t dir, uint8_t inA, uint8_t inB, uint8_t en, uint8_t pwm){
@@ -570,7 +571,6 @@ void setup(){
 }
 
 void loop(){
-  int hz[3] = {0, 0, 0};
   static uint32_t step = 0;
 
   // 1) Features
@@ -594,21 +594,16 @@ void loop(){
   delay(500);
   uint8_t sv_deg = servo_bin_to_deg(s_bin);
   servo.write(sv_deg);
-  static const uint16_t F_beep[N_BEEP][3] = { {600,1000,1300}, {1300,1000,600}, {800,1600,800}, {1600,800,1600}, {1000,1000,1000} };
-  b_bin=beep_bin_to_freq(b_bin);
-  hz[0] = F_beep[b_bin][0];
-  hz[1] = F_beep[b_bin][1];
-  hz[2] = F_beep[b_bin][2];
 
   if (b_bin == 0){
     noTone(BEEP_PIN);
   } else {
-    tone(BEEP_PIN, hz[0],100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
-    delay(100);
-    tone(BEEP_PIN, hz[1], 100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
-    delay(100);
-    tone(BEEP_PIN, hz[2], 100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
-    delay(100);
+    for (uint8_t i = 0; i < BEEP_TONES; ++i){
+      uint16_t f = BEEP_FREQ[b_bin][i];
+      uint16_t d = BEEP_DUR[b_bin][i];
+      tone(BEEP_PIN, f, d);
+      delay(d);
+    }
   }
 
   // remember for features

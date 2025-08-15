@@ -336,11 +336,23 @@ uint8_t servo_bin_to_deg(uint8_t b){
   return (uint8_t)( (uint16_t)b * 20 ); // 0,20,40,...,180
 }
 
-int beep_bin_to_freq(uint8_t b){
-  // simple scale
-  if (b >= N_BEEP) b = N_BEEP-1;
-  return b;
-}
+// Creative beep patterns: frequency and duration for each of 5 tones per bin
+const uint8_t BEEP_TONES = 5;
+const uint16_t BEEP_FREQ[N_BEEP][BEEP_TONES] = {
+  {262, 330, 392, 523, 659}, // C-major ascent (unused when b_bin==0)
+  {659, 523, 392, 330, 262}, // mirror descent
+  {262, 392, 523, 392, 262}, // rise then fall
+  {330, 262, 330, 392, 523}, // low hop to high
+  {523, 440, 392, 440, 523}  // bell curve
+};
+
+const uint16_t BEEP_DUR[N_BEEP][BEEP_TONES] = {
+  {100, 100, 100, 100, 200}, // quick run with hold
+  {200, 100, 100, 100, 200}, // long bookends
+  {150, 150, 300, 150, 150}, // lingering center
+  {100, 200, 100, 200, 300}, // growing finale
+  {300, 150, 150, 150, 300}  // long ends
+};
 
 // Low-level: command one side given dir in {-1,0,+1} and pwm (0..255)
 inline void set_one_motor(int8_t dir, uint8_t inA, uint8_t inB, uint8_t en, uint8_t pwm){
@@ -559,7 +571,6 @@ void setup(){
 }
 
 void loop(){
-  int hz[3] = {0, 0, 0};
   static uint32_t step = 0;
 
   // 1) Features
@@ -583,21 +594,16 @@ void loop(){
   delay(500);
   uint8_t sv_deg = servo_bin_to_deg(s_bin);
   servo.write(sv_deg);
-  static const uint16_t F_beep[N_BEEP][3] = { {600,1000,1300}, {1300,1000,600}, {800,1600,800}, {1600,800,1600}, {1000,1000,1000} };
-  b_bin=beep_bin_to_freq(b_bin);
-  hz[0] = F_beep[b_bin][0];
-  hz[1] = F_beep[b_bin][1];
-  hz[2] = F_beep[b_bin][2];
 
   if (b_bin == 0){
     noTone(BEEP_PIN);
   } else {
-    tone(BEEP_PIN, hz[0],100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
-    delay(100);
-    tone(BEEP_PIN, hz[1], 100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
-    delay(100);
-    tone(BEEP_PIN, hz[2], 100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
-    delay(100);
+    for (uint8_t i = 0; i < BEEP_TONES; ++i){
+      uint16_t f = BEEP_FREQ[b_bin][i];
+      uint16_t d = BEEP_DUR[b_bin][i];
+      tone(BEEP_PIN, f, d);
+      delay(d);
+    }
   }
 
   // remember for features

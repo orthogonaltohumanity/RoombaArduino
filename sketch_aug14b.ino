@@ -1,5 +1,4 @@
-/*
-  Markov → Bandit → Φ-biased action selection with on-device learning
+/*  Markov → Bandit → Φ-biased action selection with on-device learning
   Hardware: Arduino Uno R3
 
   Flow each loop:
@@ -62,7 +61,7 @@ const int8_t MOTOR9_DIRS[9][2] = {
 // -----------------------------
 // Problem sizes (keep tiny)
 // -----------------------------
-const uint8_t N_STATE = 8;
+const uint8_t N_STATE = 2;
 const uint8_t N_MOTOR = 9;   // 9 speed bins (includes reverse/stop/forward)
 const uint8_t N_SERVO = 10;  // 10 positions [0..180]
 const uint8_t N_BEEP  = 5;   // 5 pitch bins
@@ -350,9 +349,8 @@ uint8_t servo_bin_to_deg(uint8_t b){
 
 int beep_bin_to_freq(uint8_t b){
   // simple scale
-  static const uint16_t F[N_BEEP] = { 440, 660, 880, 1320, 1760 };
   if (b >= N_BEEP) b = N_BEEP-1;
-  return F[b];
+  return b;
 }
 
 // Low-level: command one side given dir in {-1,0,+1} and pwm (0..255)
@@ -568,9 +566,11 @@ void setup(){
   noTone(BEEP_PIN);
 
   Serial.println(F("[MB-Φ] Ready."));
+  
 }
 
 void loop(){
+  int hz[3] = {0, 0, 0};
   static uint32_t step = 0;
 
   // 1) Features
@@ -594,12 +594,21 @@ void loop(){
   delay(500);
   uint8_t sv_deg = servo_bin_to_deg(s_bin);
   servo.write(sv_deg);
+  static const uint16_t F_beep[N_BEEP][3] = { {600,1000,1300}, {1300,1000,600}, {800,1600,800}, {1600,800,1600}, {1000,1000,1000} };
+  b_bin=beep_bin_to_freq(b_bin);
+  hz[0] = F_beep[b_bin][0];
+  hz[1] = F_beep[b_bin][1];
+  hz[2] = F_beep[b_bin][2];
 
-  int hz = beep_bin_to_freq(b_bin);
   if (b_bin == 0){
     noTone(BEEP_PIN);
   } else {
-    tone(BEEP_PIN, hz, 50); // short chirp; tone uses Timer2 (OK with PWM 5,6)
+    tone(BEEP_PIN, hz[0],100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
+    delay(100);
+    tone(BEEP_PIN, hz[1], 100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
+    delay(100);
+    tone(BEEP_PIN, hz[2], 100); // short chirp; tone uses Timer2 (OK with PWM 5,6)
+    delay(100);
   }
 
   // remember for features
@@ -611,6 +620,9 @@ void loop(){
 
   // 6) Reward & advantage
   int16_t r_q8 = compute_reward_q8();         // ~[-256..+256]
+  if(b_bin == 0 && r_q8 > 0){
+    r_q8 += 100;
+  }
   int16_t adv_q8 = r_q8 - rAvg_q8;
   // Update running average
   rAvg_q8 += (adv_q8 >> RAVG_BETA);

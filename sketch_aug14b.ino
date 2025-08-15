@@ -94,7 +94,6 @@ const uint8_t DECAY_DIV = 2;        // halve counts (>=1)
 const uint8_t BANDIT_REWARD_STEP = 2; // how many counts to add/sub (>=1)
 const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
 
-const uint16_t RAND_MAX16 = 65535;
 const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
 
 const int16_t PLATE_PENALTY_Q8 = -256; // penalty when collision plates touch
@@ -227,7 +226,7 @@ uint8_t sample_next_state(uint8_t s){
 
 // -----------------------------
 // Build action scores = bandit preference + Φ(x)
-// We'll use ε-greedy over these integer "scores".
+// We'll apply ε-greedy with a softmax sample over these logits.
 // -----------------------------
 
 
@@ -290,51 +289,44 @@ uint8_t random_index(){
   return (uint8_t)(urand16() % N);
 }
 template<uint8_t N>
-uint8_t sample_from_scores_as_weights(const int16_t *arr){
-  // Find minimum to shift scores to positive weights
-  int16_t mn = arr[0];
-  for (uint8_t i=1;i<N;++i) if (arr[i] < mn) mn = arr[i];
+uint8_t sample_from_logits(const int16_t *arr){
+  // Softmax sampling with integer weights: p[i] ∝ 2^{arr[i]}
+  int16_t mx = arr[0];
+  for (uint8_t i=1; i<N; ++i) if (arr[i] > mx) mx = arr[i];
 
-  // Shift = -(mn) + 1 ensures all weights >= 1 (avoids zero)
-  uint16_t shift = (uint16_t)(-(int32_t)mn + 1);
-
-  // Compute sum of weights (use 32-bit accumulator to be safe)
-  uint32_t sum = 0;
   uint16_t w[N];
-  for (uint8_t i=0;i<N;++i){
-    // weight = arr[i] + shift (arr[i] is int16, shift is uint16)
-    int32_t tmp = (int32_t)arr[i] + (int32_t)shift; // guaranteed >= 1
-    uint16_t wi = (tmp > 65535) ? 65535 : (uint16_t)tmp; // clamp just in case
-    w[i] = wi;
-    sum += wi;
+  uint32_t sum = 0;
+  for (uint8_t i=0; i<N; ++i){
+    int16_t diff = mx - arr[i];            // non-negative
+    if (diff > 15) diff = 15;              // clamp to avoid overflow
+    w[i] = (uint16_t)1 << (15 - diff);     // weight ∝ 2^{arr[i]}
+    sum += w[i];
   }
 
-  // Fallback: if something went wrong, choose uniform random
-  if (sum == 0) return (uint8_t)(urand16() % N);
+  if (sum == 0) return (uint8_t)(urand16() % N); // defensive
 
-  // Sample categorical
-  uint32_t r = (uint32_t)(urand16()) % sum;
+  uint32_t r = ((uint32_t)urand16() << 16 | urand16()) % sum;
   uint32_t acc = 0;
-  for (uint8_t i=0;i<N;++i){
+  for (uint8_t i=0; i<N; ++i){
     acc += w[i];
     if (r < acc) return i;
   }
-  return (uint8_t)((uint16_t)sum % N); // defensive fallback
+  return (uint8_t)(urand16() % N); // fallback
 }
 
 uint8_t pick_with_eps_greedy_motor(const Scores& S){
   if (randPct() < EPS_EGREEDY_PCT) return random_index<N_MOTOR>();
-  return sample_from_scores_as_weights<N_MOTOR>(S.motor);
+  return sample_from_logits<N_MOTOR>(S.motor);
 }
 
 uint8_t pick_with_eps_greedy_servo(const Scores& S){
   if (randPct() < EPS_EGREEDY_PCT) return random_index<N_SERVO>();
-  return sample_from_scores_as_weights<N_SERVO>(S.servo);
+  return sample_from_logits<N_SERVO>(S.servo);
 }
 
 uint8_t pick_with_eps_greedy_beep(const Scores& S){
   if (randPct() < EPS_EGREEDY_PCT) return random_index<N_BEEP>();
-  return sample_from_scores_as_weights<N_BEEP>(S.beep);
+  return sample_from_logits<N_BEEP>(S.beep);
 }
 
 // -----------------------------

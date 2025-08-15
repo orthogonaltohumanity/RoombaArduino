@@ -93,6 +93,7 @@ const uint8_t DECAY_PERIOD = 50;    // every 50 steps, decay counts
 const uint8_t DECAY_DIV = 2;        // halve counts (>=1)
 const uint8_t BANDIT_REWARD_STEP = 2; // how many counts to add/sub (>=1)
 const uint8_t MARKOV_REWARD_STEP = 1; // counts to add/sub (>=1)
+const uint8_t REWARD_WINDOW = 4;     // apply accumulated rewards every 4 steps
 
 const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
 
@@ -120,6 +121,21 @@ const uint8_t RAVG_BETA = 4; // EMA: new = old + (r - old)/2^RAVG_BETA
 // Bookkeeping
 uint8_t cur_state = 0;
 uint8_t prev_state = 0;
+
+struct StepRecord {
+  Feat F;
+  Scores S;
+  uint8_t prev_state;
+  uint8_t cur_state;
+  uint8_t m_bin;
+  uint8_t s_bin;
+  uint8_t b_bin;
+};
+
+StepRecord step_hist[REWARD_WINDOW];
+uint8_t hist_idx = 0;
+uint8_t steps_pending = 0;
+int32_t adv_accum_q8 = 0;
 
 uint8_t last_motor_bin = N_MOTOR/2; // start near stop
 uint8_t last_servo_bin = N_SERVO/2; // mid
@@ -613,6 +629,18 @@ void loop(){
 
   delay(20); // allow sensors to respond a bit
 
+  // store step for delayed reward
+  StepRecord &rec = step_hist[hist_idx];
+  rec.F = F;
+  rec.S = S;
+  rec.prev_state = prev_state;
+  rec.cur_state = cur_state;
+  rec.m_bin = m_bin;
+  rec.s_bin = s_bin;
+  rec.b_bin = b_bin;
+  hist_idx = (hist_idx + 1) % REWARD_WINDOW;
+  steps_pending++;
+
   // 6) Reward & advantage
   int16_t r_q8 = compute_reward_q8();         // ~[-256..+256]
   if(b_bin == 0 && r_q8 > 0){
@@ -621,11 +649,20 @@ void loop(){
   int16_t adv_q8 = r_q8 - rAvg_q8;
   // Update running average
   rAvg_q8 += (adv_q8 >> RAVG_BETA);
+  adv_accum_q8 += adv_q8;
 
-  // 7) Updates
-  update_markov(prev_state, cur_state, adv_q8);
-  update_bandits(cur_state, m_bin, s_bin, b_bin, adv_q8);
-  update_phi(F, m_bin, s_bin, b_bin, adv_q8, S);
+  if (steps_pending >= REWARD_WINDOW){
+    int16_t batch_adv = (int16_t)max(min(adv_accum_q8, (int32_t)32767), (int32_t)-32768);
+    for (uint8_t i=0;i<REWARD_WINDOW;++i){
+      StepRecord &sr = step_hist[i];
+      update_markov(sr.prev_state, sr.cur_state, batch_adv);
+      update_bandits(sr.cur_state, sr.m_bin, sr.s_bin, sr.b_bin, batch_adv);
+      update_phi(sr.F, sr.m_bin, sr.s_bin, sr.b_bin, batch_adv, sr.S);
+    }
+    adv_accum_q8 = 0;
+    steps_pending = 0;
+    hist_idx = 0;
+  }
 
   // 8) Periodic decay
   if ((++step % DECAY_PERIOD) == 0){

@@ -40,7 +40,7 @@ const int8_t MOTOR9_DIRS[9][2] = {
 const uint8_t N_MOTOR = 9;
 const uint8_t N_SERVO = 10;
 const uint8_t N_BEEP  = 5;
-const uint8_t FEAT_DIM = 6;  // [ldrL, ldrR, ldrC, lastMotor, lastServo, bias]
+const uint8_t FEAT_DIM = 8;  // [ldrL, ldrR, ldrC, lastMotor, lastServo, lastBeep, bias, pad]
 const uint8_t ACT_DIM = N_MOTOR + N_SERVO + N_BEEP; // 24
 const uint8_t IDX_MOTOR0 = 0;
 const uint8_t IDX_SERVO0 = IDX_MOTOR0 + N_MOTOR;   // 9
@@ -80,40 +80,64 @@ struct Feat {
 };
 
 // -----------------------------
-// Binary Neural Network class
+// Binary Recurrent Neural Network class
 // -----------------------------
-class BinaryNN {
+class BinaryRNN {
 public:
   static const uint8_t MAX_LAYERS = 4;
-  static const uint16_t MAX_WEIGHTS = 512;
+  static const uint16_t MAX_WEIGHTS_BITS = 1024;
   static const uint8_t MAX_NODES = 32;
   struct Layer {
     uint8_t in_dim;
     uint8_t out_dim;
-    int8_t *w; // weights in {-1,+1}
+    bool recurrent;
+    uint16_t w_in_off;  // bit offset for input weights
+    uint16_t w_rec_off; // bit offset for recurrent weights
+    int8_t state[MAX_NODES];
   };
   Layer layers[MAX_LAYERS];
   uint8_t layer_count = 0;
-  int8_t weights[MAX_WEIGHTS];
-  uint16_t offsets[MAX_LAYERS];
-  uint16_t total_weights = 0;
+  uint16_t total_bits = 0;
+  uint8_t weight_bytes[(MAX_WEIGHTS_BITS+7)/8];
 
-  void addLayer(uint8_t in_dim, uint8_t out_dim) {
+  void addLayer(uint8_t in_dim, uint8_t out_dim, bool recurrent) {
     if (layer_count >= MAX_LAYERS) return;
-    layers[layer_count].in_dim = in_dim;
-    layers[layer_count].out_dim = out_dim;
-    layers[layer_count].w = weights + total_weights;
-    offsets[layer_count] = total_weights;
-    total_weights += (uint16_t)in_dim * out_dim;
+    if ((in_dim & 7) || (out_dim & 7)) return; // require multiples of 8
+    Layer &L = layers[layer_count];
+    L.in_dim = in_dim;
+    L.out_dim = out_dim;
+    L.recurrent = recurrent;
+    L.w_in_off = total_bits;
+    total_bits += (uint16_t)in_dim * out_dim;
+    if (recurrent) {
+      L.w_rec_off = total_bits;
+      total_bits += (uint16_t)out_dim * out_dim;
+      for (uint8_t i=0;i<out_dim;++i) L.state[i] = 0;
+    } else {
+      L.w_rec_off = total_bits;
+    }
     layer_count++;
   }
 
-  uint16_t numWeights() const { return total_weights; }
+  void resetState() {
+    for (uint8_t l=0;l<layer_count;++l) {
+      if (layers[l].recurrent) {
+        for (uint8_t i=0;i<layers[l].out_dim;++i) layers[l].state[i] = 0;
+      }
+    }
+  }
+
+  uint16_t numWeightBits() const { return total_bits; }
 
   void setWeightsFromBits(const uint8_t *bits) {
-    for (uint16_t i=0;i<total_weights;++i) {
-      weights[i] = bits[i] ? 1 : -1;
+    memset(weight_bytes, 0, sizeof(weight_bytes));
+    for (uint16_t i=0;i<total_bits;++i) {
+      if (bits[i]) weight_bytes[i>>3] |= (uint8_t)1 << (i & 7);
     }
+  }
+
+  inline int8_t getWeight(uint16_t bit_index) const {
+    return (weight_bytes[bit_index>>3] >> (bit_index & 7)) & 1 ? 1 : -1;
   }
 
   void forward(const uint8_t *input, int16_t *out) {
@@ -122,24 +146,32 @@ public:
     for (uint8_t i=0;i<layers[0].in_dim;++i) bufA[i] = input[i];
     int16_t *cur_in = bufA;
     int16_t *cur_out = bufB;
-    uint16_t offset = 0;
     for (uint8_t l=0;l<layer_count;++l) {
-      uint8_t in_dim = layers[l].in_dim;
-      uint8_t out_dim = layers[l].out_dim;
+      Layer &L = layers[l];
+      uint8_t in_dim = L.in_dim;
+      uint8_t out_dim = L.out_dim;
+      uint16_t in_off = L.w_in_off;
+      uint16_t rec_off = L.w_rec_off;
       int16_t *next_out = (l==layer_count-1) ? out : cur_out;
       for (uint8_t j=0;j<out_dim;++j) {
         int16_t sum = 0;
         for (uint8_t i=0;i<in_dim;++i) {
-          int8_t w = weights[offset + j*in_dim + i];
+          int8_t w = getWeight(in_off + j*in_dim + i);
           sum += w * cur_in[i];
         }
+        if (L.recurrent) {
+          for (uint8_t i=0;i<out_dim;++i) {
+            int8_t w = getWeight(rec_off + j*out_dim + i);
+            sum += w * L.state[i];
+          }
+        }
         if (l==layer_count-1) {
-          next_out[j] = sum; // output scores
+          next_out[j] = sum;
         } else {
-          next_out[j] = (sum >= 0) ? 1 : -1; // binary activation
+          next_out[j] = (sum >= 0) ? 1 : -1;
+          if (L.recurrent) L.state[j] = (int8_t)next_out[j];
         }
       }
-      offset += (uint16_t)in_dim * out_dim;
       if (l != layer_count-1) {
         int16_t *tmp = cur_in;
         cur_in = cur_out;
@@ -149,12 +181,12 @@ public:
   }
 };
 
-BinaryNN net;
+BinaryRNN net;
 
 // CGA probability model and buffers
-uint8_t prob[BinaryNN::MAX_WEIGHTS]; // probability of bit=1 in [0,255]
-uint8_t cur_bits[BinaryNN::MAX_WEIGHTS];
-uint8_t prev_bits[BinaryNN::MAX_WEIGHTS];
+uint8_t prob[BinaryRNN::MAX_WEIGHTS_BITS]; // probability of bit=1 in [0,255]
+uint8_t cur_bits[BinaryRNN::MAX_WEIGHTS_BITS];
+uint8_t prev_bits[BinaryRNN::MAX_WEIGHTS_BITS];
 int16_t prev_reward = 0;
 bool have_prev = false;
 
@@ -213,6 +245,7 @@ Feat read_features() {
 
   uint8_t lm = (uint8_t)( (uint16_t)last_motor_bin * 28 );
   uint8_t ls = (uint8_t)( (uint16_t)last_servo_bin * 25 );
+  uint8_t lb = (uint8_t)( (uint16_t)last_beep_bin * 51 );
 
   Feat F;
   F.x[0] = l;
@@ -220,7 +253,9 @@ Feat read_features() {
   F.x[2] = c;
   F.x[3] = lm;
   F.x[4] = ls;
-  F.x[5] = 255; // bias
+  F.x[5] = lb;
+  F.x[6] = 255; // bias
+  F.x[7] = 0;   // padding
   return F;
 }
 
@@ -306,16 +341,17 @@ void setup(){
   noTone(BEEP_PIN);
   Serial.begin(9600);
 
-  net.addLayer(FEAT_DIM, 16);
-  net.addLayer(16, ACT_DIM);
-  for (uint16_t i=0;i<net.numWeights();++i) prob[i] = 128; // init 0.5
+  net.addLayer(FEAT_DIM, 16, true);
+  net.addLayer(16, ACT_DIM, false);
+  for (uint16_t i=0;i<net.numWeightBits();++i) prob[i] = 128; // init 0.5
 }
 
 void loop(){
   Feat F = read_features();
-  uint16_t nW = net.numWeights();
+  uint16_t nW = net.numWeightBits();
   sample_bits(cur_bits, nW);
   net.setWeightsFromBits(cur_bits);
+  net.resetState();
   int16_t scores[ACT_DIM];
   net.forward(F.x, scores);
 

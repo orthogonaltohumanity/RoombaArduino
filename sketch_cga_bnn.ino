@@ -131,9 +131,8 @@ public:
 
   void setWeightsFromBits(const uint8_t *bits) {
     memset(weight_bytes, 0, sizeof(weight_bytes));
-    for (uint16_t i=0;i<total_bits;++i) {
-      if (bits[i]) weight_bytes[i>>3] |= (uint8_t)1 << (i & 7);
-    }
+    uint16_t nB = (total_bits + 7) >> 3;
+    memcpy(weight_bytes, bits, nB);
   }
 
   inline int8_t getWeight(uint16_t bit_index) const {
@@ -184,9 +183,10 @@ public:
 BinaryRNN net;
 
 // CGA probability model and buffers
-uint8_t prob[BinaryRNN::MAX_WEIGHTS_BITS]; // probability of bit=1 in [0,255]
-uint8_t cur_bits[BinaryRNN::MAX_WEIGHTS_BITS];
-uint8_t prev_bits[BinaryRNN::MAX_WEIGHTS_BITS];
+// Each probability is stored as prob/256 in [0,255] -> 1 byte per weight
+uint8_t prob[BinaryRNN::MAX_WEIGHTS_BITS];
+uint8_t cur_bits[(BinaryRNN::MAX_WEIGHTS_BITS+7)/8];
+uint8_t prev_bits[(BinaryRNN::MAX_WEIGHTS_BITS+7)/8];
 int16_t prev_reward = 0;
 bool have_prev = false;
 
@@ -213,15 +213,21 @@ inline uint16_t urand16() {
 }
 
 inline void sample_bits(uint8_t *bits, uint16_t n) {
+  uint16_t nB = (n + 7) >> 3;
+  memset(bits, 0, nB);
   for (uint16_t i=0;i<n;++i) {
-    bits[i] = (uint8_t)(urand16() & 0xFF) < prob[i];
+    if ((uint8_t)(urand16() & 0xFF) < prob[i]) {
+      bits[i>>3] |= (uint8_t)1 << (i & 7);
+    }
   }
 }
 
-inline void cga_update(uint8_t *winner, uint8_t *loser, uint16_t n) {
+inline void cga_update(const uint8_t *winner, const uint8_t *loser, uint16_t n) {
   for (uint16_t i=0;i<n;++i) {
-    if (winner[i] != loser[i]) {
-      if (winner[i]) { if (prob[i] < 255) prob[i]++; }
+    uint8_t w = (winner[i>>3] >> (i & 7)) & 1;
+    uint8_t l = (loser[i>>3] >> (i & 7)) & 1;
+    if (w != l) {
+      if (w) { if (prob[i] < 255) prob[i]++; }
       else { if (prob[i] > 0) prob[i]--; }
     }
   }
@@ -384,7 +390,8 @@ void loop(){
     if (r_q8 >= prev_reward) cga_update(cur_bits, prev_bits, nW);
     else cga_update(prev_bits, cur_bits, nW);
   }
-  memcpy(prev_bits, cur_bits, nW);
+  uint16_t nB = (nW + 7) >> 3;
+  memcpy(prev_bits, cur_bits, nB);
   prev_reward = r_q8;
   have_prev = true;
 

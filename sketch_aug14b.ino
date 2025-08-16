@@ -98,6 +98,7 @@ const uint8_t REWARD_WINDOW = 4;     // apply accumulated rewards every 4 steps
 const int16_t BUTTON_REWARD_Q8  = 256;  // reward when button is pressed
 
 const int16_t PLATE_PENALTY_Q8 = -256; // penalty when collision plates touch
+const int16_t MOTOR_IDLE_PENALTY_Q8 = -64; // penalty when both motors stopped
 
 // -----------------------------
 // State & learning structures
@@ -444,13 +445,16 @@ int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
 
   }
 
-  // Reward idea: balance between A4 & A5 plus brightness on A3.
-  int clos = 1023 - abs(l - r);  // 0..1023 (higher when closer)
+  // Normalize overall brightness to [-10,10]
+  int brightness = (r + l + c) / 3; // average brightness 0..1023
+  int16_t bright_norm = (int16_t)((int32_t)brightness * 20 / 1023) - 10; // [-10..10]
+  int16_t r_q8 = (int16_t)bright_norm * 256 / 10; // scale to Q8
 
-  int16_t clos_q8 = (int16_t)((uint32_t)clos * 256u / 1023u); // 0..256
-  int16_t c_q8    = (int16_t)((uint32_t)c    * 256u / 1023u); // 0..256
+  // Penalize staying still
+  if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
+    r_q8 += MOTOR_IDLE_PENALTY_Q8;
+  }
 
-  int16_t r_q8 = clos_q8 + c_q8 - 256; // [-256..+256]
   if (r_q8 > 256) r_q8 = 256;
   if (r_q8 < -256) r_q8 = -256;
   return r_q8;
@@ -461,12 +465,14 @@ int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
 // -----------------------------
 
 void update_markov(uint8_t s_prev, uint8_t s_cur, int16_t adv_q8){
+  uint8_t scale = max((uint8_t)1, (uint8_t)(abs(adv_q8) >> 8));
+  uint16_t step = (uint16_t)MARKOV_REWARD_STEP * scale;
   if (adv_q8 >= 0){
-    uint16_t v = T_count[s_prev][s_cur] + MARKOV_REWARD_STEP;
+    uint16_t v = T_count[s_prev][s_cur] + step;
     T_count[s_prev][s_cur] = (v > 255) ? 255 : (uint8_t)v;
   } else {
     // penalize slightly but keep >=1
-    int16_t v = (int16_t)T_count[s_prev][s_cur] - (int16_t)MARKOV_REWARD_STEP;
+    int16_t v = (int16_t)T_count[s_prev][s_cur] - (int16_t)step;
     if (v < 1) v = 1;
     T_count[s_prev][s_cur] = (uint8_t)v;
   }
@@ -474,7 +480,8 @@ void update_markov(uint8_t s_prev, uint8_t s_cur, int16_t adv_q8){
 
 void update_bandits(uint8_t state, uint8_t bm, uint8_t bs, uint8_t bb, int16_t adv_q8){
   // reinforce chosen bins
-  uint8_t step = BANDIT_REWARD_STEP;
+  uint8_t scale = max((uint8_t)1, (uint8_t)(abs(adv_q8) >> 8));
+  uint16_t step = (uint16_t)BANDIT_REWARD_STEP * scale;
   if (adv_q8 >= 0){
     uint16_t v;
 
@@ -494,6 +501,7 @@ void update_bandits(uint8_t state, uint8_t bm, uint8_t bs, uint8_t bb, int16_t a
 // Keep super tiny to avoid oscillations; clamp to [-127..127].
 void update_phi(const Feat& F, uint8_t a_motor, uint8_t a_servo, uint8_t a_beep, int16_t adv_q8, const Scores& S){
   int8_t sg = (adv_q8 >= 0) ? 1 : -1;
+  uint8_t scale = max((uint8_t)1, (uint8_t)(abs(adv_q8) >> 8));
 
   // For each actuator, also find strongest competing action to push away a bit.
   auto top_other = [](const int16_t* arr, uint8_t N, uint8_t chosen)->uint8_t{
@@ -520,9 +528,9 @@ void update_phi(const Feat& F, uint8_t a_motor, uint8_t a_servo, uint8_t a_beep,
   uint8_t aB = IDX_BEEP0 + a_beep;
   uint8_t cB = IDX_BEEP0 + comp_b;
 
-  // Apply tiny updates
+  // Apply tiny updates scaled by reward magnitude
   for (uint8_t f=0; f<FEAT_DIM; ++f){
-    int16_t dw = (int16_t)sg * (int16_t)LR_PHI_NUM * (int16_t)(F.x[f] >> 5); // scale x by 1/32
+    int16_t dw = (int16_t)sg * (int16_t)LR_PHI_NUM * (int16_t)scale * (int16_t)(F.x[f] >> 5); // scale x by 1/32
     // chosen gets +dw
     W_phi[f][aM] = clamp_i8( (int16_t)W_phi[f][aM] + dw, -127, 127);
     W_phi[f][aS] = clamp_i8( (int16_t)W_phi[f][aS] + dw, -127, 127);

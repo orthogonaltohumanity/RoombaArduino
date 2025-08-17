@@ -168,35 +168,131 @@ public:
     uint8_t mask = (uint8_t)1 << (bit_index & 7);
     weight_bytes[bit_index>>3] ^= mask;
   }
+
+  void swapWeights(uint16_t a, uint16_t b) {
+    uint8_t wa = (weight_bytes[a>>3] >> (a & 7)) & 1;
+    uint8_t wb = (weight_bytes[b>>3] >> (b & 7)) & 1;
+    if (wa != wb) {
+      toggleWeight(a);
+      toggleWeight(b);
+    }
+  }
 };
 
 BinaryNN act_net, embed_net;
 
-struct HCState {
-  bool active;
-  uint16_t bit_idx;
-  int32_t reward_accum;
-  uint16_t steps;
+struct AxisSelector {
+  uint8_t uniformity;
+  uint8_t w[BinaryNN::MAX_WEIGHTS_BITS];
 };
 
-HCState hc_act = {false,0,0,0};
-HCState hc_emb = {false,0,0,0};
-const uint16_t HC_STEPS = 50;
+struct HCState {
+  bool active;
+  int32_t reward_accum;
+  uint16_t steps;
+  uint8_t swap_count;
+  uint16_t swap_from[4];
+  uint16_t swap_to[4];
+};
 
-void hillClimbStep(BinaryNN &net, HCState &hc, int16_t reward) {
+AxisSelector sel_act, sel_emb;
+HCState hc_act = {false,0,0,0,{0},{0}};
+HCState hc_emb = {false,0,0,0,{0},{0}};
+const uint16_t HC_STEPS = 50;
+const uint8_t FY_MAX_SWAPS = 4;
+
+void initAxisSelector(AxisSelector &sel, uint16_t n){
+  sel.uniformity = 128;
+  for(uint16_t i=0;i<n && i<BinaryNN::MAX_WEIGHTS_BITS;i++) sel.w[i] = 1;
+}
+
+uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
+  uint32_t total = 0;
+  for(uint16_t j=i;j<n;++j){
+    uint16_t dist = j - i;
+    uint16_t kern = (sel.uniformity + 1) / (dist + 1);
+    if(kern==0) kern=1;
+    total += (uint32_t)sel.w[j] * kern;
+  }
+  uint16_t r = urand16() % total;
+  total = 0;
+  for(uint16_t j=i;j<n;++j){
+    uint16_t dist = j - i;
+    uint16_t kern = (sel.uniformity + 1) / (dist + 1);
+    if(kern==0) kern=1;
+    total += (uint32_t)sel.w[j] * kern;
+    if(r < total) return j;
+  }
+  return i;
+}
+
+void fisherYatesMutate(BinaryNN &net, AxisSelector &sel, HCState &hc){
+  uint16_t n = net.numWeightBits();
+  hc.swap_count = 0;
+  uint16_t start = urand16() % n;
+  for(uint8_t iter=0; iter<FY_MAX_SWAPS && (start+iter)<(n-1); ++iter){
+    uint16_t i = start + iter;
+    uint16_t j = weightedSelect(i, n, sel);
+    if(i!=j && hc.swap_count < FY_MAX_SWAPS){
+      net.swapWeights(i,j);
+      hc.swap_from[hc.swap_count] = i;
+      hc.swap_to[hc.swap_count] = j;
+      hc.swap_count++;
+    }
+  }
+}
+
+void revertSwaps(BinaryNN &net, HCState &hc){
+  for(uint8_t k=0;k<hc.swap_count;++k){
+    net.swapWeights(hc.swap_from[k], hc.swap_to[k]);
+  }
+}
+
+void updateSelector(AxisSelector &sel, HCState &hc, bool positive){
+  if(positive){
+    if(sel.uniformity>0) sel.uniformity--;
+    for(uint8_t k=0;k<hc.swap_count;++k){
+      uint16_t idx = hc.swap_to[k];
+      if(sel.w[idx]<255) sel.w[idx]++;
+      idx = hc.swap_from[k];
+      if(sel.w[idx]<255) sel.w[idx]++;
+    }
+  } else {
+    if(sel.uniformity<255) sel.uniformity++;
+    for(uint8_t k=0;k<hc.swap_count;++k){
+      uint16_t idx = hc.swap_to[k];
+      if(sel.w[idx]>1) sel.w[idx]--;
+      idx = hc.swap_from[k];
+      if(sel.w[idx]>1) sel.w[idx]--;
+    }
+  }
+}
+
+void backgroundBitFlip(BinaryNN &net){
+  uint16_t n = net.numWeightBits();
+  for(uint16_t i=0;i<n;++i){
+    if((urand16() % 100) == 0){
+      net.toggleWeight(i);
+    }
+  }
+}
+
+void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward) {
   if (hc.active) {
     hc.reward_accum += reward;
     hc.steps++;
     if (hc.steps >= HC_STEPS) {
       if (hc.reward_accum <= 0) {
-        net.toggleWeight(hc.bit_idx);
+        revertSwaps(net, hc);
+        updateSelector(sel, hc, false);
+      } else {
+        updateSelector(sel, hc, true);
       }
       hc.active = false;
     }
   }
   if (!hc.active) {
-    hc.bit_idx = urand16() % net.numWeightBits();
-    net.toggleWeight(hc.bit_idx);
+    fisherYatesMutate(net, sel, hc);
     hc.active = true;
     hc.reward_accum = 0;
     hc.steps = 0;
@@ -345,6 +441,8 @@ void setup(){
   act_net.addLayer(24, ACT_DIM);
   embed_net.randomizeWeights();
   act_net.randomizeWeights();
+  initAxisSelector(sel_emb, embed_net.numWeightBits());
+  initAxisSelector(sel_act, act_net.numWeightBits());
 }
 
 void loop(){
@@ -391,8 +489,10 @@ void loop(){
 
   int16_t r_q8 = compute_reward_q8();
 
-  hillClimbStep(embed_net, hc_emb, r_q8);
-  hillClimbStep(act_net, hc_act, r_q8);
+  hillClimbStep(embed_net, hc_emb, sel_emb, r_q8);
+  hillClimbStep(act_net, hc_act, sel_act, r_q8);
+  backgroundBitFlip(embed_net);
+  backgroundBitFlip(act_net);
 
   Serial.print("r_q8="); Serial.println(r_q8);
   delay(20);

@@ -194,6 +194,7 @@ public:
 
 BinaryNN act_net, embed_net;
 
+
 // Running average reward baseline
 int16_t reward_avg_q8 = 0;
 const uint8_t RAVG_BETA = 4;
@@ -351,6 +352,7 @@ void loop(){
   one_hot[IDX_BEEP0  + last_beep_bin]  = 255;
 
   // Run embedding network
+
   int16_t emb_scores[EMB_DIM];
   embed_net.forward(one_hot, emb_scores);
   uint8_t emb_feat[EMB_DIM];

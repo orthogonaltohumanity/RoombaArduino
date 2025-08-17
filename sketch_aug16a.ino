@@ -245,7 +245,6 @@ void initAxisSelector(AxisSelector &sel, uint16_t n){
   sel.w = (uint8_t*)malloc(bytes);
   memset(sel.w, 0, bytes);
   for(uint16_t i=0;i<n;++i) setAxisWeight(sel, i, true);
-}
 
 uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
   uint32_t total = 0;

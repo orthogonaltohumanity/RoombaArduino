@@ -183,8 +183,18 @@ BinaryNN act_net, embed_net;
 
 struct AxisSelector {
   uint8_t uniformity;
-  uint8_t w[BinaryNN::MAX_WEIGHTS_BITS];
+  uint8_t w[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
 };
+
+inline bool getAxisWeight(const AxisSelector &sel, uint16_t idx){
+  return (sel.w[idx >> 3] >> (idx & 7)) & 0x01;
+}
+
+inline void setAxisWeight(AxisSelector &sel, uint16_t idx, bool val){
+  uint8_t mask = 1 << (idx & 7);
+  if(val) sel.w[idx >> 3] |= mask;
+  else    sel.w[idx >> 3] &= ~mask;
+}
 
 struct HCState {
   bool active;
@@ -203,7 +213,8 @@ const uint8_t FY_MAX_SWAPS = 4;
 
 void initAxisSelector(AxisSelector &sel, uint16_t n){
   sel.uniformity = 128;
-  for(uint16_t i=0;i<n && i<BinaryNN::MAX_WEIGHTS_BITS;i++) sel.w[i] = 1;
+  for(uint16_t i=0;i<(BinaryNN::MAX_WEIGHTS_BITS+7)/8;i++) sel.w[i] = 0;
+  for(uint16_t i=0;i<n && i<BinaryNN::MAX_WEIGHTS_BITS;i++) setAxisWeight(sel, i, true);
 }
 
 uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
@@ -212,15 +223,16 @@ uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
     uint16_t dist = j - i;
     uint16_t kern = (sel.uniformity + 1) / (dist + 1);
     if(kern==0) kern=1;
-    total += (uint32_t)sel.w[j] * kern;
+    total += (uint32_t)getAxisWeight(sel, j) * kern;
   }
+  if(total == 0) return i;
   uint16_t r = urand16() % total;
   total = 0;
   for(uint16_t j=i;j<n;++j){
     uint16_t dist = j - i;
     uint16_t kern = (sel.uniformity + 1) / (dist + 1);
     if(kern==0) kern=1;
-    total += (uint32_t)sel.w[j] * kern;
+    total += (uint32_t)getAxisWeight(sel, j) * kern;
     if(r < total) return j;
   }
   return i;
@@ -253,17 +265,17 @@ void updateSelector(AxisSelector &sel, HCState &hc, bool positive){
     if(sel.uniformity>0) sel.uniformity--;
     for(uint8_t k=0;k<hc.swap_count;++k){
       uint16_t idx = hc.swap_to[k];
-      if(sel.w[idx]<255) sel.w[idx]++;
+      setAxisWeight(sel, idx, true);
       idx = hc.swap_from[k];
-      if(sel.w[idx]<255) sel.w[idx]++;
+      setAxisWeight(sel, idx, true);
     }
   } else {
     if(sel.uniformity<255) sel.uniformity++;
     for(uint8_t k=0;k<hc.swap_count;++k){
       uint16_t idx = hc.swap_to[k];
-      if(sel.w[idx]>1) sel.w[idx]--;
+      setAxisWeight(sel, idx, false);
       idx = hc.swap_from[k];
-      if(sel.w[idx]>1) sel.w[idx]--;
+      setAxisWeight(sel, idx, false);
     }
   }
 }

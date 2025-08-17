@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Servo.h>
+#include <string.h>
 
 // -----------------------------
 // Hardware pins (same as other sketches)
@@ -40,7 +41,7 @@ const int8_t MOTOR9_DIRS[9][2] = {
 const uint8_t N_MOTOR = 9;
 const uint8_t N_SERVO = 10;
 const uint8_t N_BEEP  = 5;
-const uint8_t FEAT_DIM = 8;  // [ldrL, ldrR, ldrC, lastMotor, lastServo, lastBeep, bias, pad]
+const uint8_t FEAT_DIM = 32; // [ldrL, ldrR, ldrC, last actions one-hot (24), bias, padding]
 const uint8_t ACT_DIM = N_MOTOR + N_SERVO + N_BEEP; // 24
 const uint8_t IDX_MOTOR0 = 0;
 const uint8_t IDX_SERVO0 = IDX_MOTOR0 + N_MOTOR;   // 9
@@ -85,7 +86,7 @@ struct Feat {
 class BinaryNN {
 public:
   static const uint8_t MAX_LAYERS = 4;
-  static const uint16_t MAX_WEIGHTS_BITS = 1024;
+  static const uint16_t MAX_WEIGHTS_BITS = 2560;
   static const uint8_t MAX_NODES = 32;
 
   struct Layer {
@@ -210,6 +211,7 @@ inline void cga_update(const uint8_t *winner, const uint8_t *loser, uint16_t n) 
 uint8_t last_motor_bin = N_MOTOR/2;
 uint8_t last_servo_bin = N_SERVO/2;
 uint8_t last_beep_bin  = 0;
+uint8_t last_out[ACT_DIM];
 
 Feat read_features() {
   uint16_t l0 = smooth_analog_read(LDR_L_PIN, ldr_l_avg);
@@ -220,19 +222,15 @@ Feat read_features() {
   uint8_t r = (uint8_t)(r0 >> 2);
   uint8_t c = (uint8_t)(c0 >> 2);
 
-  uint8_t lm = (uint8_t)((uint16_t)last_motor_bin * 28);
-  uint8_t ls = (uint8_t)((uint16_t)last_servo_bin * 25);
-  uint8_t lb = (uint8_t)((uint16_t)last_beep_bin * 51);
-
   Feat F;
   F.x[0] = l;
   F.x[1] = r;
   F.x[2] = c;
-  F.x[3] = lm;
-  F.x[4] = ls;
-  F.x[5] = lb;
-  F.x[6] = 255; // bias
-  F.x[7] = 0;   // padding
+  memcpy(&F.x[3], last_out, ACT_DIM);
+  F.x[3+ACT_DIM] = 255; // bias
+  for (uint8_t i = 3 + ACT_DIM + 1; i < FEAT_DIM; ++i) {
+    F.x[i] = 0;  // padding
+  }
   return F;
 }
 
@@ -319,10 +317,17 @@ void setup(){
   noTone(BEEP_PIN);
   Serial.begin(9600);
 
-  net.addLayer(FEAT_DIM, 16);
-  net.addLayer(16, 16);
-  net.addLayer(16, ACT_DIM);
+  // 3-layer MLP: 32 -> 24 -> 24 -> 24 -> 24
+  net.addLayer(FEAT_DIM, 24);
+  net.addLayer(24, 24);
+  net.addLayer(24, 24);
+  net.addLayer(24, ACT_DIM);
   for (uint16_t i=0;i<net.numWeightBits();++i) prob[i] = 128; // init 0.5
+
+  memset(last_out, 0, sizeof(last_out));
+  last_out[IDX_MOTOR0 + last_motor_bin] = 255;
+  last_out[IDX_SERVO0 + last_servo_bin] = 255;
+  last_out[IDX_BEEP0  + last_beep_bin]  = 255;
 }
 
 void loop(){
@@ -355,17 +360,29 @@ void loop(){
   last_motor_bin = m_bin;
   last_servo_bin = s_bin;
   last_beep_bin  = b_bin;
+  memset(last_out, 0, sizeof(last_out));
+  last_out[IDX_MOTOR0 + m_bin] = 255;
+  last_out[IDX_SERVO0 + s_bin] = 255;
+  last_out[IDX_BEEP0  + b_bin] = 255;
 
   int16_t r_q8 = compute_reward_q8();
   int16_t adv_q8 = r_q8 - reward_avg_q8;
   reward_avg_q8 += (adv_q8 >> RAVG_BETA);
 
+  uint8_t *winner_bits = cur_bits;
+  uint8_t *loser_bits = prev_bits;
   if (have_prev){
-    if (adv_q8 >= 0) cga_update(cur_bits, prev_bits, nW);
-    else cga_update(prev_bits, cur_bits, nW);
+    if (adv_q8 >= 0) {
+      winner_bits = cur_bits;
+      loser_bits = prev_bits;
+    } else {
+      winner_bits = prev_bits;
+      loser_bits = cur_bits;
+    }
+    cga_update(winner_bits, loser_bits, nW);
   }
   uint16_t nB = (nW + 7) >> 3;
-  memcpy(prev_bits, cur_bits, nB);
+  memcpy(prev_bits, winner_bits, nB);
   have_prev = true;
 
   Serial.print("r_q8="); Serial.println(r_q8);

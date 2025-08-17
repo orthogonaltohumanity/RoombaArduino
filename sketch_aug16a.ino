@@ -164,40 +164,44 @@ public:
     }
   }
 
-  void hebbianUpdate(int16_t reward_q8) {
-    uint8_t p_act = reward_q8 > 0 ? (reward_q8 > 256 ? 255 : reward_q8) : 0;
-    uint8_t p_decay = 255 - p_act;
-    for (uint8_t l=0;l<layer_count;++l) {
-      Layer &L = layers[l];
-      uint8_t in_dim = L.in_dim;
-      uint8_t out_dim = L.out_dim;
-      uint16_t off = L.w_off;
-      for (uint8_t j=0;j<out_dim;++j) {
-        for (uint8_t i=0;i<in_dim;++i) {
-          uint16_t bit_idx = off + j*in_dim + i;
-          uint8_t mask = (uint8_t)1 << (bit_idx & 7);
-          uint8_t rnd = (uint8_t)(urand16() & 0xFF);
-          if (acts[l][i] && acts[l+1][j]) {
-            if (rnd < p_act) {
-              weight_bytes[bit_idx>>3] |= mask;
-            }
-          } else {
-            if (rnd < p_decay) {
-              weight_bytes[bit_idx>>3] &= (uint8_t)~mask;
-            }
-          }
-        }
-      }
-    }
+  void toggleWeight(uint16_t bit_index) {
+    uint8_t mask = (uint8_t)1 << (bit_index & 7);
+    weight_bytes[bit_index>>3] ^= mask;
   }
 };
 
 BinaryNN act_net, embed_net;
 
+struct HCState {
+  bool active;
+  uint16_t bit_idx;
+  int32_t reward_accum;
+  uint16_t steps;
+};
 
-// Running average reward baseline
-int16_t reward_avg_q8 = 0;
-const uint8_t RAVG_BETA = 4;
+HCState hc_act = {false,0,0,0};
+HCState hc_emb = {false,0,0,0};
+const uint16_t HC_STEPS = 50;
+
+void hillClimbStep(BinaryNN &net, HCState &hc, int16_t reward) {
+  if (hc.active) {
+    hc.reward_accum += reward;
+    hc.steps++;
+    if (hc.steps >= HC_STEPS) {
+      if (hc.reward_accum <= 0) {
+        net.toggleWeight(hc.bit_idx);
+      }
+      hc.active = false;
+    }
+  }
+  if (!hc.active) {
+    hc.bit_idx = urand16() % net.numWeightBits();
+    net.toggleWeight(hc.bit_idx);
+    hc.active = true;
+    hc.reward_accum = 0;
+    hc.steps = 0;
+  }
+}
 
 // -----------------------------
 // Sensor smoothing and random helpers
@@ -352,7 +356,6 @@ void loop(){
   one_hot[IDX_BEEP0  + last_beep_bin]  = 255;
 
   // Run embedding network
-
   int16_t emb_scores[EMB_DIM];
   embed_net.forward(one_hot, emb_scores);
   uint8_t emb_feat[EMB_DIM];
@@ -387,11 +390,9 @@ void loop(){
   last_beep_bin  = b_bin;
 
   int16_t r_q8 = compute_reward_q8();
-  int16_t adv_q8 = r_q8 - reward_avg_q8;
-  reward_avg_q8 += (adv_q8 >> RAVG_BETA);
 
-  embed_net.hebbianUpdate(adv_q8);
-  act_net.hebbianUpdate(adv_q8);
+  hillClimbStep(embed_net, hc_emb, r_q8);
+  hillClimbStep(act_net, hc_act, r_q8);
 
   Serial.print("r_q8="); Serial.println(r_q8);
   delay(20);

@@ -86,6 +86,7 @@ uint16_t urand16();
 struct HCState {
   bool active;
   int32_t reward_accum;
+  int32_t reward_avg;
   uint16_t steps;
   uint8_t swap_count;
   uint16_t swap_from[4];
@@ -233,9 +234,10 @@ inline void setAxisWeight(AxisSelector &sel, uint16_t idx, bool val){
 
 
 AxisSelector sel_act, sel_emb;
-HCState hc_act = {false,0,0,0,{0},{0}};
-HCState hc_emb = {false,0,0,0,{0},{0}};
+HCState hc_act = {false,0,0,0,0,{0},{0}};
+HCState hc_emb = {false,0,0,0,0,{0},{0}};
 const uint16_t HC_STEPS = 50;
+const uint8_t HC_AVG_SHIFT = 3; // 1/8 smoothing
 const uint8_t FY_MAX_SWAPS = 4;
 
 void initAxisSelector(AxisSelector &sel, uint16_t n){
@@ -323,11 +325,16 @@ void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward
     hc.reward_accum += reward;
     hc.steps++;
     if (hc.steps >= HC_STEPS) {
-      if (hc.reward_accum <= 0) {
+      if (hc.reward_accum <= hc.reward_avg) {
         revertSwaps(net, hc);
         updateSelector(sel, hc, false);
       } else {
         updateSelector(sel, hc, true);
+      }
+      if (hc.reward_avg == 0) {
+        hc.reward_avg = hc.reward_accum;
+      } else {
+        hc.reward_avg += (hc.reward_accum - hc.reward_avg) >> HC_AVG_SHIFT;
       }
       hc.active = false;
     }

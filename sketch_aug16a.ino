@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Servo.h>
 #include <string.h>
+#include <stdlib.h>
 
 // -----------------------------
 // Hardware pins (same as other sketches)
@@ -89,8 +90,6 @@ uint16_t urand16();
 class BinaryNN {
 public:
   static const uint8_t MAX_LAYERS = 4;
-  static const uint16_t MAX_WEIGHTS_BITS = 2560;
-  static const uint8_t MAX_NODES = 32;
 
   struct Layer {
     uint8_t in_dim;
@@ -101,8 +100,12 @@ public:
   Layer layers[MAX_LAYERS];
   uint8_t layer_count = 0;
   uint16_t total_bits = 0;
-  uint8_t weight_bytes[(MAX_WEIGHTS_BITS+7)/8];
-  uint8_t acts[MAX_LAYERS+1][MAX_NODES];
+
+  uint8_t *weight_bytes = nullptr;
+  uint8_t *acts = nullptr;
+  int16_t *bufA = nullptr;
+  int16_t *bufB = nullptr;
+  uint8_t max_nodes = 0;
 
   void addLayer(uint8_t in_dim, uint8_t out_dim) {
     if (layer_count >= MAX_LAYERS) return;
@@ -113,6 +116,19 @@ public:
     L.w_off = total_bits;
     total_bits += (uint16_t)in_dim * out_dim;
     layer_count++;
+  }
+
+  void initBuffers() {
+    uint16_t nB = (total_bits + 7) >> 3;
+    weight_bytes = (uint8_t*)malloc(nB);
+    max_nodes = 0;
+    for (uint8_t l=0; l<layer_count; ++l) {
+      if (layers[l].in_dim > max_nodes) max_nodes = layers[l].in_dim;
+      if (layers[l].out_dim > max_nodes) max_nodes = layers[l].out_dim;
+    }
+    acts = (uint8_t*)malloc((layer_count + 1) * max_nodes);
+    bufA = (int16_t*)malloc(max_nodes * sizeof(int16_t));
+    bufB = (int16_t*)malloc(max_nodes * sizeof(int16_t));
   }
 
   uint16_t numWeightBits() const { return total_bits; }
@@ -128,10 +144,13 @@ public:
     return (weight_bytes[bit_index>>3] >> (bit_index & 7)) & 1 ? 1 : -1;
   }
 
+  inline uint8_t* layerActs(uint8_t layer_idx) const {
+    return acts + layer_idx * max_nodes;
+  }
+
   void forward(const uint8_t *input, int16_t *out) {
-    for (uint8_t i=0;i<layers[0].in_dim;++i) acts[0][i] = (input[i] > 127) ? 1 : 0;
-    int16_t bufA[MAX_NODES];
-    int16_t bufB[MAX_NODES];
+    uint8_t *acts0 = layerActs(0);
+    for (uint8_t i=0;i<layers[0].in_dim;++i) acts0[i] = (input[i] > 127) ? 1 : 0;
     for (uint8_t i=0;i<layers[0].in_dim;++i) bufA[i] = input[i];
     int16_t *cur_in = bufA;
     int16_t *cur_out = bufB;
@@ -141,6 +160,7 @@ public:
       uint8_t out_dim = L.out_dim;
       uint16_t off = L.w_off;
       int16_t *next_out = (l==layer_count-1) ? out : cur_out;
+      uint8_t *acts_next = layerActs(l+1);
       for (uint8_t j=0;j<out_dim;++j) {
         int16_t sum = 0;
         for (uint8_t i=0;i<in_dim;++i) {
@@ -149,11 +169,11 @@ public:
         }
         if (l==layer_count-1) {
           next_out[j] = sum;
-          acts[l+1][j] = (sum >= 0) ? 1 : 0;
+          acts_next[j] = (sum >= 0) ? 1 : 0;
         } else {
           int16_t act = (sum >= 0 ? 1 : -1);
           next_out[j] = act;
-          acts[l+1][j] = (act > 0) ? 1 : 0;
+          acts_next[j] = (act > 0) ? 1 : 0;
         }
       }
       if (l != layer_count-1) {
@@ -177,14 +197,31 @@ public:
       toggleWeight(b);
     }
   }
+
+  ~BinaryNN() {
+    free(weight_bytes);
+    free(acts);
+    free(bufA);
+    free(bufB);
+  }
 };
 
 BinaryNN act_net, embed_net;
 
 struct AxisSelector {
   uint8_t uniformity;
-  uint8_t w[BinaryNN::MAX_WEIGHTS_BITS];
+  uint8_t *w = nullptr;
 };
+
+inline bool getAxisWeight(const AxisSelector &sel, uint16_t idx){
+  return (sel.w[idx >> 3] >> (idx & 7)) & 0x01;
+}
+
+inline void setAxisWeight(AxisSelector &sel, uint16_t idx, bool val){
+  uint8_t mask = 1 << (idx & 7);
+  if(val) sel.w[idx >> 3] |= mask;
+  else    sel.w[idx >> 3] &= ~mask;
+}
 
 struct HCState {
   bool active;
@@ -203,7 +240,11 @@ const uint8_t FY_MAX_SWAPS = 4;
 
 void initAxisSelector(AxisSelector &sel, uint16_t n){
   sel.uniformity = 128;
-  for(uint16_t i=0;i<n && i<BinaryNN::MAX_WEIGHTS_BITS;i++) sel.w[i] = 1;
+  uint16_t bytes = (n + 7) >> 3;
+  if(sel.w) free(sel.w);
+  sel.w = (uint8_t*)malloc(bytes);
+  memset(sel.w, 0, bytes);
+  for(uint16_t i=0;i<n;++i) setAxisWeight(sel, i, true);
 }
 
 uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
@@ -212,15 +253,16 @@ uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
     uint16_t dist = j - i;
     uint16_t kern = (sel.uniformity + 1) / (dist + 1);
     if(kern==0) kern=1;
-    total += (uint32_t)sel.w[j] * kern;
+    total += (uint32_t)getAxisWeight(sel, j) * kern;
   }
+  if(total == 0) return i;
   uint16_t r = urand16() % total;
   total = 0;
   for(uint16_t j=i;j<n;++j){
     uint16_t dist = j - i;
     uint16_t kern = (sel.uniformity + 1) / (dist + 1);
     if(kern==0) kern=1;
-    total += (uint32_t)sel.w[j] * kern;
+    total += (uint32_t)getAxisWeight(sel, j) * kern;
     if(r < total) return j;
   }
   return i;
@@ -253,17 +295,17 @@ void updateSelector(AxisSelector &sel, HCState &hc, bool positive){
     if(sel.uniformity>0) sel.uniformity--;
     for(uint8_t k=0;k<hc.swap_count;++k){
       uint16_t idx = hc.swap_to[k];
-      if(sel.w[idx]<255) sel.w[idx]++;
+      setAxisWeight(sel, idx, true);
       idx = hc.swap_from[k];
-      if(sel.w[idx]<255) sel.w[idx]++;
+      setAxisWeight(sel, idx, true);
     }
   } else {
     if(sel.uniformity<255) sel.uniformity++;
     for(uint8_t k=0;k<hc.swap_count;++k){
       uint16_t idx = hc.swap_to[k];
-      if(sel.w[idx]>1) sel.w[idx]--;
+      setAxisWeight(sel, idx, false);
       idx = hc.swap_from[k];
-      if(sel.w[idx]>1) sel.w[idx]--;
+      setAxisWeight(sel, idx, false);
     }
   }
 }
@@ -439,6 +481,8 @@ void setup(){
   act_net.addLayer(24, 24);
   act_net.addLayer(24, 24);
   act_net.addLayer(24, ACT_DIM);
+  embed_net.initBuffers();
+  act_net.initBuffers();
   embed_net.randomizeWeights();
   act_net.randomizeWeights();
   initAxisSelector(sel_emb, embed_net.numWeightBits());

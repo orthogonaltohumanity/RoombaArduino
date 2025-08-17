@@ -199,17 +199,20 @@ bool have_prev = false;
 // -----------------------------
 const uint8_t LDR_SMOOTH_SHIFT = 3; // 1/8 smoothing
 uint16_t ldr_l_avg = 0, ldr_r_avg = 0, ldr_c_avg = 0;
-int last_r=0, last_l=0, last_c=0;
+int last_r=0, last_l=0, last_c=0; // last light diffs relative to moving avg
 bool last_button_pressed=false, last_plate_contact=false;
 
-inline uint16_t smooth_analog_read(uint8_t pin, uint16_t &avg) {
+// Read an analog pin, update its moving average, and return the
+// deviation from that average.  This lets downstream code reason
+// about changes in light rather than absolute levels.
+inline int16_t read_ldr_diff(uint8_t pin, uint16_t &avg) {
   uint16_t raw = analogRead(pin);
   if (avg == 0) {
     avg = raw;
   } else {
     avg += ((int16_t)raw - (int16_t)avg) >> LDR_SMOOTH_SHIFT;
   }
-  return avg;
+  return (int16_t)raw - (int16_t)avg;
 }
 
 inline uint16_t urand16() {
@@ -250,13 +253,21 @@ uint8_t last_servo_bin = N_SERVO/2;
 uint8_t last_beep_bin  = 0;
 
 Feat read_features() {
-  uint16_t l0 = smooth_analog_read(LDR_L_PIN, ldr_l_avg);
-  uint16_t r0 = smooth_analog_read(LDR_R_PIN, ldr_r_avg);
-  uint16_t c0 = smooth_analog_read(LDR_C_PIN, ldr_c_avg);
+  int16_t l_diff = read_ldr_diff(LDR_L_PIN, ldr_l_avg);
+  int16_t r_diff = read_ldr_diff(LDR_R_PIN, ldr_r_avg);
+  int16_t c_diff = read_ldr_diff(LDR_C_PIN, ldr_c_avg);
 
-  uint8_t l = (uint8_t)(l0 >> 2);
-  uint8_t r = (uint8_t)(r0 >> 2);
-  uint8_t c = (uint8_t)(c0 >> 2);
+  // Map differences [-1023,1023] roughly to [0,255] with 128 meaning no change
+  int16_t l_val = (l_diff >> 3) + 128;
+  if (l_val < 0) l_val = 0; else if (l_val > 255) l_val = 255;
+  int16_t r_val = (r_diff >> 3) + 128;
+  if (r_val < 0) r_val = 0; else if (r_val > 255) r_val = 255;
+  int16_t c_val = (c_diff >> 3) + 128;
+  if (c_val < 0) c_val = 0; else if (c_val > 255) c_val = 255;
+
+  uint8_t l = (uint8_t)l_val;
+  uint8_t r = (uint8_t)r_val;
+  uint8_t c = (uint8_t)c_val;
 
   uint8_t lm = (uint8_t)( (uint16_t)last_motor_bin * 28 );
   uint8_t ls = (uint8_t)( (uint16_t)last_servo_bin * 25 );
@@ -310,9 +321,9 @@ inline void set_motor_state9(uint8_t bin){
 // Reward
 // -----------------------------
 int16_t compute_reward_q8(){
-  int r = smooth_analog_read(LDR_R_PIN, ldr_r_avg);
-  int l = smooth_analog_read(LDR_L_PIN, ldr_l_avg);
-  int c = smooth_analog_read(LDR_C_PIN, ldr_c_avg);
+  int16_t r = read_ldr_diff(LDR_R_PIN, ldr_r_avg);
+  int16_t l = read_ldr_diff(LDR_L_PIN, ldr_l_avg);
+  int16_t c = read_ldr_diff(LDR_C_PIN, ldr_c_avg);
 
   last_r = r; last_l = l; last_c = c;
   last_button_pressed = (digitalRead(BUTTON_PIN) == LOW);
@@ -321,7 +332,7 @@ int16_t compute_reward_q8(){
   if (last_plate_contact) return PLATE_PENALTY_Q8;
   if (last_button_pressed) return BUTTON_REWARD_Q8;
 
-  // Reward relative to ambient light
+  // Reward relative to the moving-average baseline of each sensor
   int side_avg = (r + l) / 2;
   int diff = side_avg - c;
   int16_t r_q8 = (int16_t)((int32_t)diff * 256 / 1023);

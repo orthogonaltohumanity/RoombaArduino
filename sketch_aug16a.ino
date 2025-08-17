@@ -41,8 +41,9 @@ const int8_t MOTOR9_DIRS[9][2] = {
 const uint8_t N_MOTOR = 9;
 const uint8_t N_SERVO = 10;
 const uint8_t N_BEEP  = 5;
-const uint8_t FEAT_DIM = 32; // [ldrL, ldrR, ldrC, last actions one-hot (24), bias, padding]
 const uint8_t ACT_DIM = N_MOTOR + N_SERVO + N_BEEP; // 24
+const uint8_t EMB_DIM = 8;              // embedding size (multiple of 8)
+const uint8_t FEAT_DIM = 16;            // [ldrL, ldrR, ldrC, last action embedding (8), bias, padding]
 const uint8_t IDX_MOTOR0 = 0;
 const uint8_t IDX_SERVO0 = IDX_MOTOR0 + N_MOTOR;   // 9
 const uint8_t IDX_BEEP0  = IDX_SERVO0 + N_SERVO;   // 19
@@ -151,12 +152,15 @@ public:
   }
 };
 
-BinaryNN net;
+BinaryNN act_net, embed_net;
 
-// CGA probability model and buffers
-uint8_t prob[BinaryNN::MAX_WEIGHTS_BITS];
-uint8_t cur_bits[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
-uint8_t prev_bits[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
+// CGA probability models and buffers for both networks
+uint8_t prob_act[BinaryNN::MAX_WEIGHTS_BITS];
+uint8_t cur_bits_act[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
+uint8_t prev_bits_act[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
+uint8_t prob_emb[BinaryNN::MAX_WEIGHTS_BITS];
+uint8_t cur_bits_emb[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
+uint8_t prev_bits_emb[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
 // Running average reward baseline
 int16_t reward_avg_q8 = 0;
 const uint8_t RAVG_BETA = 4;
@@ -184,7 +188,7 @@ inline uint16_t urand16() {
   return ( (uint16_t)rand() << 1 ) ^ (uint16_t)rand();
 }
 
-inline void sample_bits(uint8_t *bits, uint16_t n) {
+inline void sample_bits(uint8_t *bits, const uint8_t *prob, uint16_t n) {
   uint16_t nB = (n + 7) >> 3;
   memset(bits, 0, nB);
   for (uint16_t i=0;i<n;++i) {
@@ -194,7 +198,7 @@ inline void sample_bits(uint8_t *bits, uint16_t n) {
   }
 }
 
-inline void cga_update(const uint8_t *winner, const uint8_t *loser, uint16_t n) {
+inline void cga_update(uint8_t *prob, const uint8_t *winner, const uint8_t *loser, uint16_t n) {
   for (uint16_t i=0;i<n;++i) {
     uint8_t w = (winner[i>>3] >> (i & 7)) & 1;
     uint8_t l = (loser[i>>3] >> (i & 7)) & 1;
@@ -211,9 +215,8 @@ inline void cga_update(const uint8_t *winner, const uint8_t *loser, uint16_t n) 
 uint8_t last_motor_bin = N_MOTOR/2;
 uint8_t last_servo_bin = N_SERVO/2;
 uint8_t last_beep_bin  = 0;
-uint8_t last_out[ACT_DIM];
 
-Feat read_features() {
+Feat read_features(const uint8_t *emb) {
   uint16_t l0 = smooth_analog_read(LDR_L_PIN, ldr_l_avg);
   uint16_t r0 = smooth_analog_read(LDR_R_PIN, ldr_r_avg);
   uint16_t c0 = smooth_analog_read(LDR_C_PIN, ldr_c_avg);
@@ -226,9 +229,9 @@ Feat read_features() {
   F.x[0] = l;
   F.x[1] = r;
   F.x[2] = c;
-  memcpy(&F.x[3], last_out, ACT_DIM);
-  F.x[3+ACT_DIM] = 255; // bias
-  for (uint8_t i = 3 + ACT_DIM + 1; i < FEAT_DIM; ++i) {
+  for (uint8_t i=0;i<EMB_DIM;++i) F.x[3+i] = emb[i];
+  F.x[3+EMB_DIM] = 255; // bias
+  for (uint8_t i = 3 + EMB_DIM + 1; i < FEAT_DIM; ++i) {
     F.x[i] = 0;  // padding
   }
   return F;
@@ -317,26 +320,40 @@ void setup(){
   noTone(BEEP_PIN);
   Serial.begin(9600);
 
-  // 3-layer MLP: 32 -> 24 -> 24 -> 24 -> 24
-  net.addLayer(FEAT_DIM, 24);
-  net.addLayer(24, 24);
-  net.addLayer(24, 24);
-  net.addLayer(24, ACT_DIM);
-  for (uint16_t i=0;i<net.numWeightBits();++i) prob[i] = 128; // init 0.5
-
-  memset(last_out, 0, sizeof(last_out));
-  last_out[IDX_MOTOR0 + last_motor_bin] = 255;
-  last_out[IDX_SERVO0 + last_servo_bin] = 255;
-  last_out[IDX_BEEP0  + last_beep_bin]  = 255;
+  // Embedding network and action network
+  embed_net.addLayer(ACT_DIM, EMB_DIM);
+  act_net.addLayer(FEAT_DIM, 24);
+  act_net.addLayer(24, 24);
+  act_net.addLayer(24, 24);
+  act_net.addLayer(24, ACT_DIM);
+  for (uint16_t i=0;i<embed_net.numWeightBits();++i) prob_emb[i] = 128;
+  for (uint16_t i=0;i<act_net.numWeightBits();++i)   prob_act[i] = 128;
 }
 
 void loop(){
-  Feat F = read_features();
-  uint16_t nW = net.numWeightBits();
-  sample_bits(cur_bits, nW);
-  net.setWeightsFromBits(cur_bits);
+  // One-hot of previous action
+  uint8_t one_hot[ACT_DIM];
+  memset(one_hot, 0, sizeof(one_hot));
+  one_hot[IDX_MOTOR0 + last_motor_bin] = 255;
+  one_hot[IDX_SERVO0 + last_servo_bin] = 255;
+  one_hot[IDX_BEEP0  + last_beep_bin]  = 255;
+
+  // Sample embedding network
+  uint16_t nW_emb = embed_net.numWeightBits();
+  sample_bits(cur_bits_emb, prob_emb, nW_emb);
+  embed_net.setWeightsFromBits(cur_bits_emb);
+  int16_t emb_scores[EMB_DIM];
+  embed_net.forward(one_hot, emb_scores);
+  uint8_t emb_feat[EMB_DIM];
+  for (uint8_t i=0;i<EMB_DIM;++i) emb_feat[i] = emb_scores[i] >= 0 ? 255 : 0;
+
+  // Build features and run action network
+  Feat F = read_features(emb_feat);
+  uint16_t nW_act = act_net.numWeightBits();
+  sample_bits(cur_bits_act, prob_act, nW_act);
+  act_net.setWeightsFromBits(cur_bits_act);
   int16_t scores[ACT_DIM];
-  net.forward(F.x, scores);
+  act_net.forward(F.x, scores);
 
   // choose actions by argmax in each group
   int16_t best = -32768; uint8_t m_bin = 0;
@@ -360,29 +377,24 @@ void loop(){
   last_motor_bin = m_bin;
   last_servo_bin = s_bin;
   last_beep_bin  = b_bin;
-  memset(last_out, 0, sizeof(last_out));
-  last_out[IDX_MOTOR0 + m_bin] = 255;
-  last_out[IDX_SERVO0 + s_bin] = 255;
-  last_out[IDX_BEEP0  + b_bin] = 255;
 
   int16_t r_q8 = compute_reward_q8();
   int16_t adv_q8 = r_q8 - reward_avg_q8;
   reward_avg_q8 += (adv_q8 >> RAVG_BETA);
 
-  uint8_t *winner_bits = cur_bits;
-  uint8_t *loser_bits = prev_bits;
   if (have_prev){
     if (adv_q8 >= 0) {
-      winner_bits = cur_bits;
-      loser_bits = prev_bits;
+      cga_update(prob_act, cur_bits_act, prev_bits_act, nW_act);
+      cga_update(prob_emb, cur_bits_emb, prev_bits_emb, nW_emb);
     } else {
-      winner_bits = prev_bits;
-      loser_bits = cur_bits;
+      cga_update(prob_act, prev_bits_act, cur_bits_act, nW_act);
+      cga_update(prob_emb, prev_bits_emb, cur_bits_emb, nW_emb);
     }
-    cga_update(winner_bits, loser_bits, nW);
   }
-  uint16_t nB = (nW + 7) >> 3;
-  memcpy(prev_bits, winner_bits, nB);
+  uint16_t nB_act = (nW_act + 7) >> 3;
+  uint16_t nB_emb = (nW_emb + 7) >> 3;
+  memcpy(prev_bits_act, cur_bits_act, nB_act);
+  memcpy(prev_bits_emb, cur_bits_emb, nB_emb);
   have_prev = true;
 
   Serial.print("r_q8="); Serial.println(r_q8);

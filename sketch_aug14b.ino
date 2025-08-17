@@ -445,10 +445,10 @@ int16_t compute_reward_q8(){ // returns Q8 fixed in [-256..256]
 
   }
 
-  // Normalize overall brightness to [-10,10]
-  int brightness = (r + l + c) / 3; // average brightness 0..1023
-  int16_t bright_norm = (int16_t)((int32_t)brightness * 20 / 1023) - 10; // [-10..10]
-  int16_t r_q8 = (int16_t)bright_norm * 256 / 10; // scale to Q8
+  // Raw reward: brightness relative to ambient light (A3)
+  int side_avg = (r + l) / 2;             // average of side sensors
+  int diff = side_avg - c;                // relative to ambient
+  int16_t r_q8 = (int16_t)((int32_t)diff * 256 / 1023); // scale to Q8
 
   // Penalize staying still
   if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {

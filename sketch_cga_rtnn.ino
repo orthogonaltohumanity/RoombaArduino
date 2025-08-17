@@ -189,7 +189,9 @@ uint8_t prob_neg[TernaryRNN::MAX_WEIGHTS]; // P(weight=-1)
 uint8_t prob_pos[TernaryRNN::MAX_WEIGHTS]; // P(weight=+1)
 int8_t cur_trits[TernaryRNN::MAX_WEIGHTS];
 int8_t prev_trits[TernaryRNN::MAX_WEIGHTS];
-int16_t prev_reward = 0;
+// Running reward baseline
+int16_t reward_avg_q8 = 0;
+const uint8_t RAVG_BETA = 4;
 bool have_prev = false;
 
 // -----------------------------
@@ -319,9 +321,10 @@ int16_t compute_reward_q8(){
   if (last_plate_contact) return PLATE_PENALTY_Q8;
   if (last_button_pressed) return BUTTON_REWARD_Q8;
 
-  int brightness = (r + l + c) / 3;
-  int16_t bright_norm = (int16_t)((int32_t)brightness * 20 / 1023) - 10;
-  int16_t r_q8 = (int16_t)bright_norm * 256 / 10;
+  // Reward relative to ambient light
+  int side_avg = (r + l) / 2;
+  int diff = side_avg - c;
+  int16_t r_q8 = (int16_t)((int32_t)diff * 256 / 1023);
 
   if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
     r_q8 += MOTOR_IDLE_PENALTY_Q8;
@@ -389,13 +392,14 @@ void loop(){
   last_beep_bin  = b_bin;
 
   int16_t r_q8 = compute_reward_q8();
+  int16_t adv_q8 = r_q8 - reward_avg_q8;
+  reward_avg_q8 += (adv_q8 >> RAVG_BETA);
 
   if (have_prev){
-    if (r_q8 >= prev_reward) cga_update_trits(cur_trits, prev_trits, nW);
+    if (adv_q8 >= 0) cga_update_trits(cur_trits, prev_trits, nW);
     else cga_update_trits(prev_trits, cur_trits, nW);
   }
   memcpy(prev_trits, cur_trits, nW);
-  prev_reward = r_q8;
   have_prev = true;
 
   Serial.print("r_q8="); Serial.println(r_q8);

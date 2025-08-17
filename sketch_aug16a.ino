@@ -81,6 +81,8 @@ struct Feat {
   uint8_t x[FEAT_DIM];
 };
 
+uint16_t urand16();
+
 // -----------------------------
 // Binary Feedforward Neural Network
 // -----------------------------
@@ -100,6 +102,7 @@ public:
   uint8_t layer_count = 0;
   uint16_t total_bits = 0;
   uint8_t weight_bytes[(MAX_WEIGHTS_BITS+7)/8];
+  uint8_t acts[MAX_LAYERS+1][MAX_NODES];
 
   void addLayer(uint8_t in_dim, uint8_t out_dim) {
     if (layer_count >= MAX_LAYERS) return;
@@ -114,9 +117,11 @@ public:
 
   uint16_t numWeightBits() const { return total_bits; }
 
-  void setWeightsFromBits(const uint8_t *bits) {
+  void randomizeWeights() {
     uint16_t nB = (total_bits + 7) >> 3;
-    memcpy(weight_bytes, bits, nB);
+    for (uint16_t i=0;i<nB;++i) {
+      weight_bytes[i] = (uint8_t)(urand16() & 0xFF);
+    }
   }
 
   inline int8_t getWeight(uint16_t bit_index) const {
@@ -124,6 +129,7 @@ public:
   }
 
   void forward(const uint8_t *input, int16_t *out) {
+    for (uint8_t i=0;i<layers[0].in_dim;++i) acts[0][i] = (input[i] > 127) ? 1 : 0;
     int16_t bufA[MAX_NODES];
     int16_t bufB[MAX_NODES];
     for (uint8_t i=0;i<layers[0].in_dim;++i) bufA[i] = input[i];
@@ -141,7 +147,14 @@ public:
           int8_t w = getWeight(off + j*in_dim + i);
           sum += w * cur_in[i];
         }
-        next_out[j] = (l==layer_count-1) ? sum : (sum >= 0 ? 1 : -1);
+        if (l==layer_count-1) {
+          next_out[j] = sum;
+          acts[l+1][j] = (sum >= 0) ? 1 : 0;
+        } else {
+          int16_t act = (sum >= 0 ? 1 : -1);
+          next_out[j] = act;
+          acts[l+1][j] = (act > 0) ? 1 : 0;
+        }
       }
       if (l != layer_count-1) {
         int16_t *tmp = cur_in;
@@ -150,21 +163,41 @@ public:
       }
     }
   }
+
+  void hebbianUpdate(int16_t reward_q8) {
+    uint8_t p_act = reward_q8 > 0 ? (reward_q8 > 256 ? 255 : reward_q8) : 0;
+    uint8_t p_decay = 255 - p_act;
+    for (uint8_t l=0;l<layer_count;++l) {
+      Layer &L = layers[l];
+      uint8_t in_dim = L.in_dim;
+      uint8_t out_dim = L.out_dim;
+      uint16_t off = L.w_off;
+      for (uint8_t j=0;j<out_dim;++j) {
+        for (uint8_t i=0;i<in_dim;++i) {
+          uint16_t bit_idx = off + j*in_dim + i;
+          uint8_t mask = (uint8_t)1 << (bit_idx & 7);
+          uint8_t rnd = (uint8_t)(urand16() & 0xFF);
+          if (acts[l][i] && acts[l+1][j]) {
+            if (rnd < p_act) {
+              weight_bytes[bit_idx>>3] |= mask;
+            }
+          } else {
+            if (rnd < p_decay) {
+              weight_bytes[bit_idx>>3] &= (uint8_t)~mask;
+            }
+          }
+        }
+      }
+    }
+  }
 };
 
 BinaryNN act_net, embed_net;
 
-// CGA probability models and buffers for both networks
-uint8_t prob_act[BinaryNN::MAX_WEIGHTS_BITS];
-uint8_t cur_bits_act[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
-uint8_t prev_bits_act[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
-uint8_t prob_emb[BinaryNN::MAX_WEIGHTS_BITS];
-uint8_t cur_bits_emb[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
-uint8_t prev_bits_emb[(BinaryNN::MAX_WEIGHTS_BITS+7)/8];
+
 // Running average reward baseline
 int16_t reward_avg_q8 = 0;
 const uint8_t RAVG_BETA = 4;
-bool have_prev = false;
 
 // -----------------------------
 // Sensor smoothing and random helpers
@@ -188,26 +221,6 @@ inline uint16_t urand16() {
   return ( (uint16_t)rand() << 1 ) ^ (uint16_t)rand();
 }
 
-inline void sample_bits(uint8_t *bits, const uint8_t *prob, uint16_t n) {
-  uint16_t nB = (n + 7) >> 3;
-  memset(bits, 0, nB);
-  for (uint16_t i=0;i<n;++i) {
-    if ((uint8_t)(urand16() & 0xFF) < prob[i]) {
-      bits[i>>3] |= (uint8_t)1 << (i & 7);
-    }
-  }
-}
-
-inline void cga_update(uint8_t *prob, const uint8_t *winner, const uint8_t *loser, uint16_t n) {
-  for (uint16_t i=0;i<n;++i) {
-    uint8_t w = (winner[i>>3] >> (i & 7)) & 1;
-    uint8_t l = (loser[i>>3] >> (i & 7)) & 1;
-    if (w != l) {
-      if (w) { if (prob[i] < 255) prob[i]++; }
-      else   { if (prob[i] >   0) prob[i]--; }
-    }
-  }
-}
 
 // -----------------------------
 // Feature extraction
@@ -326,8 +339,8 @@ void setup(){
   act_net.addLayer(24, 24);
   act_net.addLayer(24, 24);
   act_net.addLayer(24, ACT_DIM);
-  for (uint16_t i=0;i<embed_net.numWeightBits();++i) prob_emb[i] = 128;
-  for (uint16_t i=0;i<act_net.numWeightBits();++i)   prob_act[i] = 128;
+  embed_net.randomizeWeights();
+  act_net.randomizeWeights();
 }
 
 void loop(){
@@ -338,10 +351,8 @@ void loop(){
   one_hot[IDX_SERVO0 + last_servo_bin] = 255;
   one_hot[IDX_BEEP0  + last_beep_bin]  = 255;
 
-  // Sample embedding network
-  uint16_t nW_emb = embed_net.numWeightBits();
-  sample_bits(cur_bits_emb, prob_emb, nW_emb);
-  embed_net.setWeightsFromBits(cur_bits_emb);
+  // Run embedding network
+
   int16_t emb_scores[EMB_DIM];
   embed_net.forward(one_hot, emb_scores);
   uint8_t emb_feat[EMB_DIM];
@@ -349,9 +360,6 @@ void loop(){
 
   // Build features and run action network
   Feat F = read_features(emb_feat);
-  uint16_t nW_act = act_net.numWeightBits();
-  sample_bits(cur_bits_act, prob_act, nW_act);
-  act_net.setWeightsFromBits(cur_bits_act);
   int16_t scores[ACT_DIM];
   act_net.forward(F.x, scores);
 
@@ -382,20 +390,8 @@ void loop(){
   int16_t adv_q8 = r_q8 - reward_avg_q8;
   reward_avg_q8 += (adv_q8 >> RAVG_BETA);
 
-  if (have_prev){
-    if (adv_q8 >= 0) {
-      cga_update(prob_act, cur_bits_act, prev_bits_act, nW_act);
-      cga_update(prob_emb, cur_bits_emb, prev_bits_emb, nW_emb);
-    } else {
-      cga_update(prob_act, prev_bits_act, cur_bits_act, nW_act);
-      cga_update(prob_emb, prev_bits_emb, cur_bits_emb, nW_emb);
-    }
-  }
-  uint16_t nB_act = (nW_act + 7) >> 3;
-  uint16_t nB_emb = (nW_emb + 7) >> 3;
-  memcpy(prev_bits_act, cur_bits_act, nB_act);
-  memcpy(prev_bits_emb, cur_bits_emb, nB_emb);
-  have_prev = true;
+  embed_net.hebbianUpdate(adv_q8);
+  act_net.hebbianUpdate(adv_q8);
 
   Serial.print("r_q8="); Serial.println(r_q8);
   delay(20);

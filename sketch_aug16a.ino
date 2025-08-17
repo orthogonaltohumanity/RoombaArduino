@@ -44,7 +44,7 @@ const uint8_t N_SERVO = 10;
 const uint8_t N_BEEP  = 5;
 const uint8_t ACT_DIM = N_MOTOR + N_SERVO + N_BEEP; // 24
 const uint8_t EMB_DIM = 8;              // embedding size (multiple of 8)
-const uint8_t FEAT_DIM = 16;            // [ldrL, ldrR, ldrC, last action embedding (8), bias, padding]
+const uint8_t FEAT_DIM = 16;            // [ldrL, ldrR, ldrC, plate, button, last action embedding (8), bias, padding]
 const uint8_t IDX_MOTOR0 = 0;
 const uint8_t IDX_SERVO0 = IDX_MOTOR0 + N_MOTOR;   // 9
 const uint8_t IDX_BEEP0  = IDX_SERVO0 + N_SERVO;   // 19
@@ -378,14 +378,18 @@ Feat read_features(const uint8_t *emb) {
   uint8_t l = (uint8_t)(l0 >> 2);
   uint8_t r = (uint8_t)(r0 >> 2);
   uint8_t c = (uint8_t)(c0 >> 2);
+  bool plate_contact = (digitalRead(PLATE_PIN) == LOW);
+  bool button_pressed = (digitalRead(BUTTON_PIN) == LOW);
 
   Feat F;
   F.x[0] = l;
   F.x[1] = r;
   F.x[2] = c;
-  for (uint8_t i=0;i<EMB_DIM;++i) F.x[3+i] = emb[i];
-  F.x[3+EMB_DIM] = 255; // bias
-  for (uint8_t i = 3 + EMB_DIM + 1; i < FEAT_DIM; ++i) {
+  F.x[3] = plate_contact ? 255 : 0;
+  F.x[4] = button_pressed ? 255 : 0;
+  for (uint8_t i=0;i<EMB_DIM;++i) F.x[5+i] = emb[i];
+  F.x[5+EMB_DIM] = 255; // bias
+  for (uint8_t i = 5 + EMB_DIM + 1; i < FEAT_DIM; ++i) {
     F.x[i] = 0;  // padding
   }
   return F;

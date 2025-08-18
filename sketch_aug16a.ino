@@ -452,10 +452,9 @@ int16_t compute_reward_q8(){
   if (last_plate_contact) return PLATE_PENALTY_Q8;
   if (last_button_pressed) return BUTTON_REWARD_Q8;
 
-  // Reward relative to ambient light (A3)
-  int side_avg = (r + l) / 2;
-  int diff = side_avg - c;
-  int16_t r_q8 = (int16_t)((int32_t)diff * 256 / 1023);
+  // Reward based on total brightness across all LDR sensors
+  int total = r + l + c;
+  int16_t r_q8 = (int16_t)((int32_t)total * 256 / (3 * 1023));
 
   if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
     r_q8 += MOTOR_IDLE_PENALTY_Q8;

@@ -354,6 +354,8 @@ const uint8_t LDR_SMOOTH_SHIFT = 3; // 1/8 smoothing
 uint16_t ldr_l_avg = 0, ldr_r_avg = 0, ldr_c_avg = 0;
 int last_r=0, last_l=0, last_c=0;
 bool last_button_pressed=false, last_plate_contact=false;
+int32_t total_light_avg = 0;
+int16_t reward_avg_q8 = 0;
 
 inline uint16_t smooth_analog_read(uint8_t pin, uint16_t &avg) {
   uint16_t raw = analogRead(pin);
@@ -449,21 +451,34 @@ int16_t compute_reward_q8(){
   last_button_pressed = (digitalRead(BUTTON_PIN) == LOW);
   last_plate_contact = (digitalRead(PLATE_PIN) == LOW);
 
-  if (last_plate_contact) return PLATE_PENALTY_Q8;
-  if (last_button_pressed) return BUTTON_REWARD_Q8;
+  int16_t r_q8;
 
-  // Reward relative to ambient light (A3)
-  int side_avg = (r + l) / 2;
-  int diff = side_avg - c;
-  int16_t r_q8 = (int16_t)((int32_t)diff * 256 / 1023);
-
-  if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
-    r_q8 += MOTOR_IDLE_PENALTY_Q8;
+  if (last_plate_contact) {
+    r_q8 = PLATE_PENALTY_Q8;
+  } else if (last_button_pressed) {
+    r_q8 = BUTTON_REWARD_Q8;
+  } else {
+    int total = r + l + c;
+    if (total_light_avg == 0) {
+      total_light_avg = total;
+    } else {
+      total_light_avg += ((int32_t)total - total_light_avg) >> LDR_SMOOTH_SHIFT;
+    }
+    int total_rel = total - total_light_avg;
+    // Reward based on brightness relative to moving average
+    r_q8 = (int16_t)((int32_t)total_rel * 256 / (3 * 1023));
+    if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
+      r_q8 += MOTOR_IDLE_PENALTY_Q8;
+    }
+    if (r_q8 > 256) r_q8 = 256;
+    if (r_q8 < -256) r_q8 = -256;
   }
 
-  if (r_q8 > 256) r_q8 = 256;
-  if (r_q8 < -256) r_q8 = -256;
-  return r_q8;
+  int16_t diff = r_q8 - reward_avg_q8;
+  reward_avg_q8 += diff >> HC_AVG_SHIFT;
+  if (diff > 256) diff = 256;
+  if (diff < -256) diff = -256;
+  return diff;
 }
 
 // -----------------------------

@@ -5,7 +5,7 @@ This Arduino sketch drives a small robot via two minimal **binary neural network
 ## Binary neural architecture
 The controller is composed of two BinaryNNs:
 
-* **Embedding network** – encodes the previous action into a 6‑dimensional embedding.
+* **Embedding network** – encodes the previous action into a 8‑dimensional embedding.
 * **Action network** – maps the embedding and current sensor features to logits for motor, servo, and beep bins.
 
 Every weight is a single bit \(w_{ij}\in\{-1,+1\}\), so matrix–vector products reduce to integer adds/subtracts. Activations are hard signs, yielding extremely cheap inference on the AVR.

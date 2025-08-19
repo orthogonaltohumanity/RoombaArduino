@@ -3,9 +3,15 @@
 #include <string.h>
 #include <stdlib.h>
 
+
+const uint8_t FY_MAX_SWAPS = 4;     // keep your current value if already defined
+// Total capacity of the swap log per trial (for 4 layers)
+const uint8_t SWAP_CAP      = FY_MAX_SWAPS * 4;  // adjust if MAX_LAYERS != 4
 // -----------------------------
 // Hardware pins (same as other sketches)
 // -----------------------------
+
+
 #define LDR_L_PIN   A4
 #define LDR_R_PIN   A5
 #define LDR_C_PIN   A3
@@ -89,9 +95,10 @@ struct HCState {
   int32_t reward_avg;
   uint16_t steps;
   uint8_t swap_count;
-  uint16_t swap_from[4];
-  uint16_t swap_to[4];
+  uint16_t swap_from[SWAP_CAP];  // was [4]
+  uint16_t swap_to[SWAP_CAP];    // was [4]
 };
+
 // -----------------------------
 // Binary Feedforward Neural Network
 // -----------------------------
@@ -215,75 +222,98 @@ public:
 };
 
 BinaryNN act_net, embed_net;
+// Round-robin layer pointers for each net
+uint8_t rr_layer_act = 0;
+uint8_t rr_layer_emb = 0;
+
+const uint8_t LAMBDA_MAX = 8;   // cap; tune as you like
+const uint8_t HC_STEPS   = 50;  // keep your existing value if already defined
+// How many swaps per layer to attempt
+
 
 struct AxisSelector {
-  uint8_t uniformity;
-  uint8_t *w = nullptr;
+  // Locality: bigger = more local (shorter hops). Range 0..LAMBDA_MAX
+  uint8_t lambda;
 };
 
-inline bool getAxisWeight(const AxisSelector &sel, uint16_t idx){
-  return (sel.w[idx >> 3] >> (idx & 7)) & 0x01;
-}
 
-inline void setAxisWeight(AxisSelector &sel, uint16_t idx, bool val){
-  uint8_t mask = 1 << (idx & 7);
-  if(val) sel.w[idx >> 3] |= mask;
-  else    sel.w[idx >> 3] &= ~mask;
-}
 
 
 
 AxisSelector sel_act, sel_emb;
 HCState hc_act = {false,0,0,0,0,{0},{0}};
 HCState hc_emb = {false,0,0,0,0,{0},{0}};
-const uint16_t HC_STEPS = 50;
 const uint8_t HC_AVG_SHIFT = 3; // 1/8 smoothing
-const uint8_t FY_MAX_SWAPS = 4;
 
-void initAxisSelector(AxisSelector &sel, uint16_t n){
-  sel.uniformity = 128;
-  uint16_t bytes = (n + 7) >> 3;
-  if(sel.w) free(sel.w);
-  sel.w = (uint8_t*)malloc(bytes);
-  memset(sel.w, 0, bytes);
-  for(uint16_t i=0;i<n;++i) setAxisWeight(sel, i, true);
-}
-uint16_t weightedSelect(uint16_t i, uint16_t n, AxisSelector &sel){
-  uint32_t total = 0;
-  for(uint16_t j=i;j<n;++j){
-    uint16_t dist = j - i;
-    uint16_t kern = (sel.uniformity + 1) / (dist + 1);
-    if(kern==0) kern=1;
-    total += (uint32_t)getAxisWeight(sel, j) * kern;
-  }
-  if(total == 0) return i;
-  uint16_t r = urand16() % total;
-  total = 0;
-  for(uint16_t j=i;j<n;++j){
-    uint16_t dist = j - i;
-    uint16_t kern = (sel.uniformity + 1) / (dist + 1);
-    if(kern==0) kern=1;
-    total += (uint32_t)getAxisWeight(sel, j) * kern;
-    if(r < total) return j;
-  }
-  return i;
+void initAxisSelector(AxisSelector &sel, uint16_t /*n*/) {
+  // Start moderately local. You can start flatter by using 0..2.
+  sel.lambda = 3;
 }
 
-void fisherYatesMutate(BinaryNN &net, AxisSelector &sel, HCState &hc){
-  uint16_t n = net.numWeightBits();
-  hc.swap_count = 0;
-  uint16_t start = urand16() % n;
-  for(uint8_t iter=0; iter<FY_MAX_SWAPS && (start+iter)<(n-1); ++iter){
+// Sample distance d ~ proportional to 2^(-lambda * d), truncated to D
+// Integer-only; no divisions; uses lambda low-bit mask checks
+inline uint16_t sample_distance_geometric(uint16_t D, uint8_t lambda) {
+  if (D == 0) return 0;
+  if (lambda == 0) {           // Uniform over [0..D]
+    return urand16() % (D + 1);
+  }
+  uint16_t d = 0;
+  // mask of lambda bits: if lambda >=16, success prob is tiny; clamp
+  uint16_t mask = (lambda >= 16) ? 0xFFFF : ((1U << lambda) - 1U);
+  while (d < D) {
+    uint16_t r = urand16();
+    // "success" means the lowest lambda bits are all zero (prob = 2^-lambda)
+    if ((r & mask) == 0) {
+      ++d;                     // keep stepping locally
+    } else {
+      break;                   // first failure -> stop
+    }
+  }
+  return d;
+}
+
+
+// Return [lo, hi] (inclusive) bit-index range for layer L
+inline void getLayerBitRange(const BinaryNN &net, uint8_t L, uint16_t &lo, uint16_t &hi){
+  const uint16_t off  = net.layers[L].w_off;
+  const uint16_t size = (uint16_t)net.layers[L].in_dim * net.layers[L].out_dim;
+  lo = off;
+  hi = off + size - 1;
+}
+
+
+void fisherYatesMutate_Layer(BinaryNN &net, AxisSelector &sel, HCState &hc, uint8_t layer_idx){
+  if (net.layer_count == 0) return;
+  if (layer_idx >= net.layer_count) layer_idx = 0;
+
+  uint16_t lo, hi;
+  getLayerBitRange(net, layer_idx, lo, hi);
+  if (hi <= lo) return;
+
+  const uint16_t span  = (uint16_t)(hi - lo + 1);
+  uint16_t start       = lo + (urand16() % span);
+
+  uint8_t did = 0;  // how many swaps we’ve added for THIS layer
+  for (uint8_t iter=0; iter<FY_MAX_SWAPS && (start + iter) < hi; ++iter){
+    if (hc.swap_count >= SWAP_CAP) break;        // protect the log
+
     uint16_t i = start + iter;
-    uint16_t j = weightedSelect(i, n, sel);
-    if(i!=j && hc.swap_count < FY_MAX_SWAPS){
-      net.swapWeights(i,j);
+    uint16_t D = hi - i;                         // within-layer distance
+    if (D == 0) break;
+
+    uint16_t d = sample_distance_geometric(D, sel.lambda);
+    uint16_t j = i + d;
+
+    if (i != j){
+      net.swapWeights(i, j);
       hc.swap_from[hc.swap_count] = i;
-      hc.swap_to[hc.swap_count] = j;
+      hc.swap_to[hc.swap_count]   = j;
       hc.swap_count++;
+      did++;
     }
   }
 }
+
 
 void revertSwaps(BinaryNN &net, HCState &hc){
   for(uint8_t k=0;k<hc.swap_count;++k){
@@ -292,29 +322,23 @@ void revertSwaps(BinaryNN &net, HCState &hc){
 }
 
 void updateSelector(AxisSelector &sel, HCState &hc, bool positive){
-  if(positive){
-    if(sel.uniformity>0) sel.uniformity--;
-    for(uint8_t k=0;k<hc.swap_count;++k){
-      uint16_t idx = hc.swap_to[k];
-      setAxisWeight(sel, idx, true);
-      idx = hc.swap_from[k];
-      setAxisWeight(sel, idx, true);
-    }
+  (void)hc; // no axis-specific bookkeeping anymore
+  if (positive) {
+    if (sel.lambda < LAMBDA_MAX) sel.lambda++;   // more local when successful
   } else {
-    if(sel.uniformity<255) sel.uniformity++;
-    for(uint8_t k=0;k<hc.swap_count;++k){
-      uint16_t idx = hc.swap_to[k];
-      setAxisWeight(sel, idx, false);
-      idx = hc.swap_from[k];
-      setAxisWeight(sel, idx, false);
-    }
+    if (sel.lambda > 0) sel.lambda--;            // flatter when not improving
   }
 }
 
-void backgroundBitFlip(BinaryNN &net){
+void backgroundBitFlip(BinaryNN &net, const AxisSelector &sel){
+  // basis points: 0..10000
+  const uint16_t P_MIN = 50;    // 0.5%
+  const uint16_t P_MAX = 200;   // 2.0%
+  uint16_t p_bg = P_MIN + ((uint16_t)(P_MAX - P_MIN) * (LAMBDA_MAX - sel.lambda)) / LAMBDA_MAX;
+
   uint16_t n = net.numWeightBits();
   for(uint16_t i=0;i<n;++i){
-    if((urand16() % 100) == 0){
+    if ((urand16() % 10000) < p_bg) {
       net.toggleWeight(i);
     }
   }
@@ -340,11 +364,19 @@ void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward
     }
   }
   if (!hc.active) {
-    fisherYatesMutate(net, sel, hc);
-    hc.active = true;
+    hc.swap_count   = 0;   // start a fresh trial-wide log
+    // Apply per-layer flips (kept inside each layer by fisherYatesMutate_Layer)
+    for (uint8_t L = 0; L < net.layer_count; ++L) {
+      fisherYatesMutate_Layer(net, sel, hc, L);
+      if (hc.swap_count >= SWAP_CAP) break;  // safety
+    }
+    hc.active       = true;
     hc.reward_accum = 0;
-    hc.steps = 0;
+    hc.steps        = 0;
   }
+
+
+
 }
 
 // -----------------------------
@@ -560,8 +592,8 @@ void loop(){
 
   hillClimbStep(embed_net, hc_emb, sel_emb, r_q8);
   hillClimbStep(act_net, hc_act, sel_act, r_q8);
-  backgroundBitFlip(embed_net);
-  backgroundBitFlip(act_net);
+  backgroundBitFlip(embed_net,sel_emb);
+  backgroundBitFlip(act_net,sel_act);
 
   Serial.print("r_q8="); Serial.println(r_q8);
   delay(20);

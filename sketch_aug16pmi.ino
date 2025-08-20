@@ -241,16 +241,20 @@ uint8_t rr_layer_emb = 0;
 
 bool saveNetwork(const BinaryNN &net, const char *filename) {
   Serial.println("Starting Network Save");
-  uint16_t nB = (net.numWeightBits() + 7) >> 3;
+  uint16_t nBits = net.numWeightBits();
   SD.remove(filename);
   File f = SD.open(filename, FILE_WRITE);
   if (!f) {
     Serial.print("Failed to open "); Serial.println(filename);
     return false;
   }
-  size_t written = f.write(net.weight_bytes, nB);
+  size_t written = 0;
+  for (uint16_t i = 0; i < nBits; ++i) {
+    uint8_t bit = (net.weight_bytes[i >> 3] >> (i & 7)) & 1;
+    written += f.write(bit);
+  }
   f.close();
-  if (written != nB) {
+  if (written != nBits) {
     Serial.print("Short write "); Serial.println(filename);
     return false;
   }
@@ -264,15 +268,23 @@ bool loadNetwork(BinaryNN &net, const char *filename) {
     Serial.print("Missing "); Serial.println(filename);
     return false;
   }
-  uint16_t nB = (net.numWeightBits() + 7) >> 3;
-  if (f.size() < nB) {
+  uint16_t nBits = net.numWeightBits();
+  if (f.size() < nBits) {
     f.close();
     Serial.print("Size mismatch "); Serial.println(filename);
     return false;
   }
-  size_t rd = f.read(net.weight_bytes, nB);
+  uint16_t nB = (nBits + 7) >> 3;
+  memset(net.weight_bytes, 0, nB);
+  size_t rd = 0;
+  for (uint16_t i = 0; i < nBits; ++i) {
+    int c = f.read();
+    if (c < 0) break;
+    if (c & 1) net.weight_bytes[i >> 3] |= (1 << (i & 7));
+    rd++;
+  }
   f.close();
-  if (rd != nB) {
+  if (rd != nBits) {
     Serial.print("Short read "); Serial.println(filename);
     return false;
   }

@@ -3,9 +3,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
-#include <SPI.h>
-#include <SD.h>
-#include <avr/pgmspace.h>
 
 
 const uint8_t FY_MAX_SWAPS = 4;     // keep your current value if already defined
@@ -14,10 +11,7 @@ const uint8_t SWAP_CAP      = FY_MAX_SWAPS * 4;  // adjust if MAX_LAYERS != 4
 // -----------------------------
 // Hardware pins (same as other sketches)
 // -----------------------------
-struct AxisSelector {
-  // Single lambda controls locality and Hebbian similarity bias.
-  uint8_t lambda;
-};
+
 
 #define LDR_L_PIN   A4
 #define LDR_R_PIN   A5
@@ -32,18 +26,12 @@ struct AxisSelector {
 #define ENB         5
 #define IN3         4
 #define IN4         7
-#define SD_CS_PIN   10
 
 // Fixed PWM speed for "on" states
 const uint8_t MOTOR_PWM_ON = 255;
 
-// SD card filenames for neural network weights
-const char *ACT_NET_FILE = "actnet.bin";
-const char *EMB_NET_FILE = "embnet.bin";
-bool sd_ready = false;
-
 // Map 9 bins to (L_dir, R_dir): -1=backward, 0=off, +1=forward
-const int8_t PROGMEM MOTOR9_DIRS[9][2] = {
+const int8_t MOTOR9_DIRS[9][2] = {
   {-1, -1},  // 0: L back,  R back
   {-1,  0},  // 1: L back,  R off
   {-1, +1},  // 2: L back,  R fwd
@@ -79,14 +67,14 @@ const int16_t MOTOR_IDLE_PENALTY_Q8 = -64; // penalty when both motors stopped
 // Beep patterns
 // -----------------------------
 const uint8_t BEEP_TONES = 5;
-const uint16_t PROGMEM BEEP_FREQ[N_BEEP][BEEP_TONES] = {
+const uint16_t BEEP_FREQ[N_BEEP][BEEP_TONES] = {
   {262, 330, 392, 523, 659},
   {659, 523, 392, 330, 262},
   {262, 392, 523, 392, 262},
   {330, 262, 330, 392, 523},
   {523, 440, 392, 440, 523}
 };
-const uint16_t PROGMEM BEEP_DUR[N_BEEP][BEEP_TONES] = {
+const uint16_t BEEP_DUR[N_BEEP][BEEP_TONES] = {
   {50, 50, 50, 50, 100},
   {100, 50, 50, 50, 100},
   {75, 75, 150, 75, 75},
@@ -239,65 +227,15 @@ BinaryNN act_net, embed_net;
 uint8_t rr_layer_act = 0;
 uint8_t rr_layer_emb = 0;
 
-bool saveNetwork(const BinaryNN &net, const char *filename) {
-  Serial.println("Starting Network Save");
-  uint16_t nBits = net.numWeightBits();
-  SD.remove(filename);
-  File f = SD.open(filename, FILE_WRITE);
-  if (!f) {
-    Serial.print("Failed to open "); Serial.println(filename);
-    return false;
-  }
-  size_t written = 0;
-  for (uint16_t i = 0; i < nBits; ++i) {
-    uint8_t bit = (net.weight_bytes[i >> 3] >> (i & 7)) & 1;
-    written += f.write(bit);
-  }
-  f.close();
-  if (written != nBits) {
-    Serial.print("Short write "); Serial.println(filename);
-    return false;
-  }
-  Serial.print("Saved "); Serial.println(filename);
-  return true;
-}
-
-bool loadNetwork(BinaryNN &net, const char *filename) {
-  File f = SD.open(filename, FILE_READ);
-  if (!f) {
-    Serial.print("Missing "); Serial.println(filename);
-    return false;
-  }
-  uint16_t nBits = net.numWeightBits();
-  if (f.size() < nBits) {
-    f.close();
-    Serial.print("Size mismatch "); Serial.println(filename);
-    return false;
-  }
-  uint16_t nB = (nBits + 7) >> 3;
-  memset(net.weight_bytes, 0, nB);
-  size_t rd = 0;
-  for (uint16_t i = 0; i < nBits; ++i) {
-    int c = f.read();
-    if (c < 0) break;
-    if (c & 1) net.weight_bytes[i >> 3] |= (1 << (i & 7));
-    rd++;
-  }
-  f.close();
-  if (rd != nBits) {
-    Serial.print("Short read "); Serial.println(filename);
-    return false;
-  }
-  Serial.print("Loaded "); Serial.println(filename);
-  return true;
-}
-
 const uint8_t LAMBDA_MAX = 8;   // cap; tune as you like
-const uint8_t HC_STEPS   = 50;  // keep your existing value if already defined
+const uint8_t HC_STEPS   = 20;  // keep your existing value if already defined
 // How many swaps per layer to attempt
 
 
-
+struct AxisSelector {
+  // Single lambda controls locality and Hebbian similarity bias.
+  uint8_t lambda;
+};
 
 
 
@@ -479,8 +417,7 @@ void backgroundBitFlip(BinaryNN &net, const AxisSelector &sel){
   }
 }
 
-bool hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward) {
-  bool improved = false;
+void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward) {
   if (hc.active) {
     hc.reward_accum += reward;
     hc.steps++;
@@ -490,7 +427,6 @@ bool hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward
         updateSelector(sel, hc, false);
       } else {
         updateSelector(sel, hc, true);
-        improved = true;
       }
       if (hc.reward_avg == 0) {
         hc.reward_avg = hc.reward_accum;
@@ -507,11 +443,14 @@ bool hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward
       fisherYatesMutate_Layer(net, sel, hc, L);
       if (hc.swap_count >= SWAP_CAP) break;  // safety
     }
+    backgroundBitFlip(net,sel);
     hc.active       = true;
     hc.reward_accum = 0;
     hc.steps        = 0;
   }
-  return improved;
+
+
+
 }
 
 // -----------------------------
@@ -587,8 +526,8 @@ inline void set_dual_motor(int8_t L_dir, int8_t R_dir, uint8_t pwm_on){
 
 inline void set_motor_state9(uint8_t bin){
   if (bin >= 9) bin = 4;
-  int8_t Ld = pgm_read_byte(&MOTOR9_DIRS[bin][0]);
-  int8_t Rd = pgm_read_byte(&MOTOR9_DIRS[bin][1]);
+  int8_t Ld = MOTOR9_DIRS[bin][0];
+  int8_t Rd = MOTOR9_DIRS[bin][1];
   set_dual_motor(Ld, Rd, MOTOR_PWM_ON);
 }
 
@@ -671,8 +610,7 @@ int16_t compute_raw_reward_q8(){
   } else {
     int total = l + r + c;
     rq8 = (int16_t)((int32_t)total * 256 / (3 * 1023));
-    if (pgm_read_byte(&MOTOR9_DIRS[last_motor_bin][0]) == 0 &&
-        pgm_read_byte(&MOTOR9_DIRS[last_motor_bin][1]) == 0) {
+    if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
       rq8 += MOTOR_IDLE_PENALTY_Q8;
     }
     if (rq8 > 256) rq8 = 256;
@@ -710,27 +648,8 @@ void setup(){
   act_net.addLayer(24, ACT_DIM);
   embed_net.initBuffers();
   act_net.initBuffers();
-  Serial.print("SD init...");
-  if (SD.begin(SD_CS_PIN)) {
-    Serial.println("ok");
-    sd_ready = true;
-    if (!loadNetwork(embed_net, EMB_NET_FILE)) {
-      Serial.println("Init embed_net");
-      embed_net.randomizeWeights();
-      Serial.println("Weights Randomized");
-      saveNetwork(embed_net, EMB_NET_FILE);
-    }
-    if (!loadNetwork(act_net, ACT_NET_FILE)) {
-      Serial.println("Init act_net");
-      act_net.randomizeWeights();
-      Serial.println("Weights Randomized");
-      saveNetwork(act_net, ACT_NET_FILE);
-    }
-  } else {
-    Serial.println("failed");
-    embed_net.randomizeWeights();
-    act_net.randomizeWeights();
-  }
+  embed_net.randomizeWeights();
+  act_net.randomizeWeights();
   initAxisSelector(sel_emb, embed_net.numWeightBits());
   initAxisSelector(sel_act, act_net.numWeightBits());
 }
@@ -763,16 +682,14 @@ void loop(){
   for (uint8_t i=0;i<N_BEEP;++i){ if (scores[IDX_BEEP0+i] > best){ best = scores[IDX_BEEP0+i]; b_bin = i; } }
 
   set_motor_state9(m_bin);
-  delay(100);
+  delay(50);
   servo.write(servo_bin_to_deg(s_bin));
   if (b_bin == 0) {
     noTone(BEEP_PIN);
   } else {
     for (uint8_t i=0;i<BEEP_TONES;++i){
-      uint16_t freq = pgm_read_word(&BEEP_FREQ[b_bin][i]);
-      uint16_t dur  = pgm_read_word(&BEEP_DUR[b_bin][i]);
-      tone(BEEP_PIN, freq, dur);
-      delay(dur);
+      tone(BEEP_PIN, BEEP_FREQ[b_bin][i], BEEP_DUR[b_bin][i]);
+      delay(BEEP_DUR[b_bin][i]/2);
     }
   }
   last_motor_bin = m_bin;
@@ -789,21 +706,9 @@ void loop(){
   if (scaled < -256.0f) scaled = -256.0f;
   int16_t r_q8 = (int16_t)scaled;
 
-  bool emb_improved = hillClimbStep(embed_net, hc_emb, sel_emb, r_q8);
-  bool act_improved = hillClimbStep(act_net, hc_act, sel_act, r_q8);
-  backgroundBitFlip(embed_net,sel_emb);
-  backgroundBitFlip(act_net,sel_act);
-  if ((emb_improved || act_improved) && !sd_ready) {
-    Serial.println("SD not ready");
-  }
-  if (sd_ready) {
-    if (emb_improved) {
-      saveNetwork(embed_net, EMB_NET_FILE);
-    }
-    if (act_improved) {
-      saveNetwork(act_net, ACT_NET_FILE);
-    }
-  }
+  hillClimbStep(embed_net, hc_emb, sel_emb, r_q8);
+  hillClimbStep(act_net, hc_act, sel_act, r_q8);
+
 
   Serial.print("r_q8="); Serial.println(r_q8);
   delay(20);

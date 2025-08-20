@@ -5,6 +5,7 @@
 #include <math.h>
 #include <SPI.h>
 #include <SD.h>
+#include <avr/pgmspace.h>
 
 
 const uint8_t FY_MAX_SWAPS = 4;     // keep your current value if already defined
@@ -42,7 +43,7 @@ const char *EMB_NET_FILE = "embnet.bin";
 bool sd_ready = false;
 
 // Map 9 bins to (L_dir, R_dir): -1=backward, 0=off, +1=forward
-const int8_t MOTOR9_DIRS[9][2] = {
+const int8_t PROGMEM MOTOR9_DIRS[9][2] = {
   {-1, -1},  // 0: L back,  R back
   {-1,  0},  // 1: L back,  R off
   {-1, +1},  // 2: L back,  R fwd
@@ -78,14 +79,14 @@ const int16_t MOTOR_IDLE_PENALTY_Q8 = -64; // penalty when both motors stopped
 // Beep patterns
 // -----------------------------
 const uint8_t BEEP_TONES = 5;
-const uint16_t BEEP_FREQ[N_BEEP][BEEP_TONES] = {
+const uint16_t PROGMEM BEEP_FREQ[N_BEEP][BEEP_TONES] = {
   {262, 330, 392, 523, 659},
   {659, 523, 392, 330, 262},
   {262, 392, 523, 392, 262},
   {330, 262, 330, 392, 523},
   {523, 440, 392, 440, 523}
 };
-const uint16_t BEEP_DUR[N_BEEP][BEEP_TONES] = {
+const uint16_t PROGMEM BEEP_DUR[N_BEEP][BEEP_TONES] = {
   {50, 50, 50, 50, 100},
   {100, 50, 50, 50, 100},
   {75, 75, 150, 75, 75},
@@ -574,8 +575,8 @@ inline void set_dual_motor(int8_t L_dir, int8_t R_dir, uint8_t pwm_on){
 
 inline void set_motor_state9(uint8_t bin){
   if (bin >= 9) bin = 4;
-  int8_t Ld = MOTOR9_DIRS[bin][0];
-  int8_t Rd = MOTOR9_DIRS[bin][1];
+  int8_t Ld = pgm_read_byte(&MOTOR9_DIRS[bin][0]);
+  int8_t Rd = pgm_read_byte(&MOTOR9_DIRS[bin][1]);
   set_dual_motor(Ld, Rd, MOTOR_PWM_ON);
 }
 
@@ -658,7 +659,8 @@ int16_t compute_raw_reward_q8(){
   } else {
     int total = l + r + c;
     rq8 = (int16_t)((int32_t)total * 256 / (3 * 1023));
-    if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
+    if (pgm_read_byte(&MOTOR9_DIRS[last_motor_bin][0]) == 0 &&
+        pgm_read_byte(&MOTOR9_DIRS[last_motor_bin][1]) == 0) {
       rq8 += MOTOR_IDLE_PENALTY_Q8;
     }
     if (rq8 > 256) rq8 = 256;
@@ -755,8 +757,10 @@ void loop(){
     noTone(BEEP_PIN);
   } else {
     for (uint8_t i=0;i<BEEP_TONES;++i){
-      tone(BEEP_PIN, BEEP_FREQ[b_bin][i], BEEP_DUR[b_bin][i]);
-      delay(BEEP_DUR[b_bin][i]);
+      uint16_t freq = pgm_read_word(&BEEP_FREQ[b_bin][i]);
+      uint16_t dur  = pgm_read_word(&BEEP_DUR[b_bin][i]);
+      tone(BEEP_PIN, freq, dur);
+      delay(dur);
     }
   }
   last_motor_bin = m_bin;

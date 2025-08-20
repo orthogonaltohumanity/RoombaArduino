@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <SPI.h>
+#include <SD.h>
 
 
 const uint8_t FY_MAX_SWAPS = 4;     // keep your current value if already defined
@@ -26,9 +28,15 @@ const uint8_t SWAP_CAP      = FY_MAX_SWAPS * 4;  // adjust if MAX_LAYERS != 4
 #define ENB         5
 #define IN3         4
 #define IN4         7
+#define SD_CS_PIN   10
 
 // Fixed PWM speed for "on" states
 const uint8_t MOTOR_PWM_ON = 255;
+
+// SD card filenames for neural network weights
+const char *ACT_NET_FILE = "actnet.bin";
+const char *EMB_NET_FILE = "embnet.bin";
+bool sd_ready = false;
 
 // Map 9 bins to (L_dir, R_dir): -1=backward, 0=off, +1=forward
 const int8_t MOTOR9_DIRS[9][2] = {
@@ -227,6 +235,46 @@ BinaryNN act_net, embed_net;
 uint8_t rr_layer_act = 0;
 uint8_t rr_layer_emb = 0;
 
+bool saveNetwork(const BinaryNN &net, const char *filename) {
+  uint16_t nB = (net.numWeightBits() + 7) >> 3;
+  SD.remove(filename);
+  File f = SD.open(filename, FILE_WRITE);
+  if (!f) {
+    Serial.print("Failed to open "); Serial.println(filename);
+    return false;
+  }
+  size_t written = f.write(net.weight_bytes, nB);
+  f.close();
+  if (written != nB) {
+    Serial.print("Short write "); Serial.println(filename);
+    return false;
+  }
+  Serial.print("Saved "); Serial.println(filename);
+  return true;
+}
+
+bool loadNetwork(BinaryNN &net, const char *filename) {
+  File f = SD.open(filename, FILE_READ);
+  if (!f) {
+    Serial.print("Missing "); Serial.println(filename);
+    return false;
+  }
+  uint16_t nB = (net.numWeightBits() + 7) >> 3;
+  if (f.size() < nB) {
+    f.close();
+    Serial.print("Size mismatch "); Serial.println(filename);
+    return false;
+  }
+  size_t rd = f.read(net.weight_bytes, nB);
+  f.close();
+  if (rd != nB) {
+    Serial.print("Short read "); Serial.println(filename);
+    return false;
+  }
+  Serial.print("Loaded "); Serial.println(filename);
+  return true;
+}
+
 const uint8_t LAMBDA_MAX = 8;   // cap; tune as you like
 const uint8_t HC_STEPS   = 50;  // keep your existing value if already defined
 // How many swaps per layer to attempt
@@ -417,7 +465,8 @@ void backgroundBitFlip(BinaryNN &net, const AxisSelector &sel){
   }
 }
 
-void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward) {
+bool hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward) {
+  bool improved = false;
   if (hc.active) {
     hc.reward_accum += reward;
     hc.steps++;
@@ -427,6 +476,7 @@ void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward
         updateSelector(sel, hc, false);
       } else {
         updateSelector(sel, hc, true);
+        improved = true;
       }
       if (hc.reward_avg == 0) {
         hc.reward_avg = hc.reward_accum;
@@ -447,9 +497,7 @@ void hillClimbStep(BinaryNN &net, HCState &hc, AxisSelector &sel, int16_t reward
     hc.reward_accum = 0;
     hc.steps        = 0;
   }
-
-
-
+  return improved;
 }
 
 // -----------------------------
@@ -647,8 +695,25 @@ void setup(){
   act_net.addLayer(24, ACT_DIM);
   embed_net.initBuffers();
   act_net.initBuffers();
-  embed_net.randomizeWeights();
-  act_net.randomizeWeights();
+  Serial.print("SD init...");
+  if (SD.begin(SD_CS_PIN)) {
+    Serial.println("ok");
+    sd_ready = true;
+    if (!loadNetwork(embed_net, EMB_NET_FILE)) {
+      Serial.println("Init embed_net");
+      embed_net.randomizeWeights();
+      saveNetwork(embed_net, EMB_NET_FILE);
+    }
+    if (!loadNetwork(act_net, ACT_NET_FILE)) {
+      Serial.println("Init act_net");
+      act_net.randomizeWeights();
+      saveNetwork(act_net, ACT_NET_FILE);
+    }
+  } else {
+    Serial.println("failed");
+    embed_net.randomizeWeights();
+    act_net.randomizeWeights();
+  }
   initAxisSelector(sel_emb, embed_net.numWeightBits());
   initAxisSelector(sel_act, act_net.numWeightBits());
 }
@@ -705,10 +770,21 @@ void loop(){
   if (scaled < -256.0f) scaled = -256.0f;
   int16_t r_q8 = (int16_t)scaled;
 
-  hillClimbStep(embed_net, hc_emb, sel_emb, r_q8);
-  hillClimbStep(act_net, hc_act, sel_act, r_q8);
+  bool emb_improved = hillClimbStep(embed_net, hc_emb, sel_emb, r_q8);
+  bool act_improved = hillClimbStep(act_net, hc_act, sel_act, r_q8);
   backgroundBitFlip(embed_net,sel_emb);
   backgroundBitFlip(act_net,sel_act);
+  if ((emb_improved || act_improved) && !sd_ready) {
+    Serial.println("SD not ready");
+  }
+  if (sd_ready) {
+    if (emb_improved) {
+      saveNetwork(embed_net, EMB_NET_FILE);
+    }
+    if (act_improved) {
+      saveNetwork(act_net, ACT_NET_FILE);
+    }
+  }
 
   Serial.print("r_q8="); Serial.println(r_q8);
   delay(20);

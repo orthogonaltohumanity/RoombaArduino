@@ -13,7 +13,10 @@ const uint8_t SWAP_CAP      = FY_MAX_SWAPS * 4;  // adjust if MAX_LAYERS != 4
 // -----------------------------
 // Hardware pins (same as other sketches)
 // -----------------------------
-
+struct AxisSelector {
+  // Single lambda controls locality and Hebbian similarity bias.
+  uint8_t lambda;
+};
 
 #define LDR_L_PIN   A4
 #define LDR_R_PIN   A5
@@ -236,6 +239,7 @@ uint8_t rr_layer_act = 0;
 uint8_t rr_layer_emb = 0;
 
 bool saveNetwork(const BinaryNN &net, const char *filename) {
+  Serial.println("Starting Network Save");
   uint16_t nB = (net.numWeightBits() + 7) >> 3;
   SD.remove(filename);
   File f = SD.open(filename, FILE_WRITE);
@@ -280,10 +284,7 @@ const uint8_t HC_STEPS   = 50;  // keep your existing value if already defined
 // How many swaps per layer to attempt
 
 
-struct AxisSelector {
-  // Single lambda controls locality and Hebbian similarity bias.
-  uint8_t lambda;
-};
+
 
 
 
@@ -702,11 +703,13 @@ void setup(){
     if (!loadNetwork(embed_net, EMB_NET_FILE)) {
       Serial.println("Init embed_net");
       embed_net.randomizeWeights();
+      Serial.println("Weights Randomized");
       saveNetwork(embed_net, EMB_NET_FILE);
     }
     if (!loadNetwork(act_net, ACT_NET_FILE)) {
       Serial.println("Init act_net");
       act_net.randomizeWeights();
+      Serial.println("Weights Randomized");
       saveNetwork(act_net, ACT_NET_FILE);
     }
   } else {

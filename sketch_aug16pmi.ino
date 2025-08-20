@@ -5,6 +5,7 @@
 #include <math.h>
 #include <SPI.h>
 #include <SD.h>
+#include <avr/pgmspace.h>
 
 
 const uint8_t FY_MAX_SWAPS = 4;     // keep your current value if already defined
@@ -42,7 +43,7 @@ const char *EMB_NET_FILE = "embnet.bin";
 bool sd_ready = false;
 
 // Map 9 bins to (L_dir, R_dir): -1=backward, 0=off, +1=forward
-const int8_t MOTOR9_DIRS[9][2] = {
+const int8_t PROGMEM MOTOR9_DIRS[9][2] = {
   {-1, -1},  // 0: L back,  R back
   {-1,  0},  // 1: L back,  R off
   {-1, +1},  // 2: L back,  R fwd
@@ -78,14 +79,14 @@ const int16_t MOTOR_IDLE_PENALTY_Q8 = -64; // penalty when both motors stopped
 // Beep patterns
 // -----------------------------
 const uint8_t BEEP_TONES = 5;
-const uint16_t BEEP_FREQ[N_BEEP][BEEP_TONES] = {
+const uint16_t PROGMEM BEEP_FREQ[N_BEEP][BEEP_TONES] = {
   {262, 330, 392, 523, 659},
   {659, 523, 392, 330, 262},
   {262, 392, 523, 392, 262},
   {330, 262, 330, 392, 523},
   {523, 440, 392, 440, 523}
 };
-const uint16_t BEEP_DUR[N_BEEP][BEEP_TONES] = {
+const uint16_t PROGMEM BEEP_DUR[N_BEEP][BEEP_TONES] = {
   {50, 50, 50, 50, 100},
   {100, 50, 50, 50, 100},
   {75, 75, 150, 75, 75},
@@ -240,16 +241,20 @@ uint8_t rr_layer_emb = 0;
 
 bool saveNetwork(const BinaryNN &net, const char *filename) {
   Serial.println("Starting Network Save");
-  uint16_t nB = (net.numWeightBits() + 7) >> 3;
+  uint16_t nBits = net.numWeightBits();
   SD.remove(filename);
   File f = SD.open(filename, FILE_WRITE);
   if (!f) {
     Serial.print("Failed to open "); Serial.println(filename);
     return false;
   }
-  size_t written = f.write(net.weight_bytes, nB);
+  size_t written = 0;
+  for (uint16_t i = 0; i < nBits; ++i) {
+    uint8_t bit = (net.weight_bytes[i >> 3] >> (i & 7)) & 1;
+    written += f.write(bit);
+  }
   f.close();
-  if (written != nB) {
+  if (written != nBits) {
     Serial.print("Short write "); Serial.println(filename);
     return false;
   }
@@ -263,15 +268,23 @@ bool loadNetwork(BinaryNN &net, const char *filename) {
     Serial.print("Missing "); Serial.println(filename);
     return false;
   }
-  uint16_t nB = (net.numWeightBits() + 7) >> 3;
-  if (f.size() < nB) {
+  uint16_t nBits = net.numWeightBits();
+  if (f.size() < nBits) {
     f.close();
     Serial.print("Size mismatch "); Serial.println(filename);
     return false;
   }
-  size_t rd = f.read(net.weight_bytes, nB);
+  uint16_t nB = (nBits + 7) >> 3;
+  memset(net.weight_bytes, 0, nB);
+  size_t rd = 0;
+  for (uint16_t i = 0; i < nBits; ++i) {
+    int c = f.read();
+    if (c < 0) break;
+    if (c & 1) net.weight_bytes[i >> 3] |= (1 << (i & 7));
+    rd++;
+  }
   f.close();
-  if (rd != nB) {
+  if (rd != nBits) {
     Serial.print("Short read "); Serial.println(filename);
     return false;
   }
@@ -574,8 +587,8 @@ inline void set_dual_motor(int8_t L_dir, int8_t R_dir, uint8_t pwm_on){
 
 inline void set_motor_state9(uint8_t bin){
   if (bin >= 9) bin = 4;
-  int8_t Ld = MOTOR9_DIRS[bin][0];
-  int8_t Rd = MOTOR9_DIRS[bin][1];
+  int8_t Ld = pgm_read_byte(&MOTOR9_DIRS[bin][0]);
+  int8_t Rd = pgm_read_byte(&MOTOR9_DIRS[bin][1]);
   set_dual_motor(Ld, Rd, MOTOR_PWM_ON);
 }
 
@@ -658,7 +671,8 @@ int16_t compute_raw_reward_q8(){
   } else {
     int total = l + r + c;
     rq8 = (int16_t)((int32_t)total * 256 / (3 * 1023));
-    if (MOTOR9_DIRS[last_motor_bin][0] == 0 && MOTOR9_DIRS[last_motor_bin][1] == 0) {
+    if (pgm_read_byte(&MOTOR9_DIRS[last_motor_bin][0]) == 0 &&
+        pgm_read_byte(&MOTOR9_DIRS[last_motor_bin][1]) == 0) {
       rq8 += MOTOR_IDLE_PENALTY_Q8;
     }
     if (rq8 > 256) rq8 = 256;
@@ -755,8 +769,10 @@ void loop(){
     noTone(BEEP_PIN);
   } else {
     for (uint8_t i=0;i<BEEP_TONES;++i){
-      tone(BEEP_PIN, BEEP_FREQ[b_bin][i], BEEP_DUR[b_bin][i]);
-      delay(BEEP_DUR[b_bin][i]);
+      uint16_t freq = pgm_read_word(&BEEP_FREQ[b_bin][i]);
+      uint16_t dur  = pgm_read_word(&BEEP_DUR[b_bin][i]);
+      tone(BEEP_PIN, freq, dur);
+      delay(dur);
     }
   }
   last_motor_bin = m_bin;
